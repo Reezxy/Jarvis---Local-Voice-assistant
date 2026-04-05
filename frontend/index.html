@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Felix Voice Assistant</title>
+  </head>
+  <body>
+    <!-- Three.js renders here -->
+    <canvas id="orb-canvas"></canvas>
+
+    <!-- Status text above the label -->
+    <div id="status-text"></div>
+
+    <!-- Persistent label at the very bottom -->
+    <div id="assistant-label">VOICE ASSISTANT</div>
+
+    <!-- Connection indicator — top-right -->
+    <div id="connection-badge">
+      <span id="connection-dot"></span>
+      <span id="connection-label">connecting</span>
+    </div>
+
+    <!-- Mute toggle -->
+    <button id="mute-button" type="button" aria-pressed="false" aria-label="Mute microphone">
+      mute
+    </button>
+
+    <!-- Error / info toast -->
+    <div id="error-text"></div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,189 @@
+/* ── Reset ───────────────────────────────────────────────────────────────── */
+*,
+*::before,
+*::after {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #050508;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── Canvas — fills the viewport behind everything ───────────────────────── */
+#orb-canvas {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+/* ── Status text — "listening…" / "thinking…" ────────────────────────────── */
+#status-text {
+  position: fixed;
+  bottom: 44px;
+  left: 50%;
+  transform: translateX(-50%);
+  color: rgba(76, 168, 232, 0.6);
+  font-size: 13px;
+  letter-spacing: 2.5px;
+  text-transform: lowercase;
+  font-weight: 300;
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 10;
+
+  /* Smooth fade when text changes */
+  transition: opacity 0.4s ease;
+}
+
+#status-text:empty {
+  opacity: 0;
+}
+
+/* ── Persistent label ─────────────────────────────────────────────────────── */
+#assistant-label {
+  position: fixed;
+  bottom: 18px;
+  left: 50%;
+  transform: translateX(-50%);
+  color: rgba(76, 168, 232, 0.18);
+  font-size: 10px;
+  letter-spacing: 5px;
+  text-transform: uppercase;
+  font-weight: 300;
+  pointer-events: none;
+  z-index: 10;
+  user-select: none;
+}
+
+/* ── Connection badge — top-right ─────────────────────────────────────────── */
+#connection-badge {
+  position: fixed;
+  top: 18px;
+  right: 18px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 12px;
+  border: 1px solid rgba(76, 168, 232, 0.12);
+  border-radius: 20px;
+  background: rgba(5, 5, 8, 0.6);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  z-index: 20;
+  pointer-events: none;
+}
+
+#connection-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.15);
+  flex-shrink: 0;
+  transition: background 0.4s ease, box-shadow 0.4s ease;
+}
+
+/* Connected */
+#connection-badge.connected #connection-dot {
+  background: #22c55e;
+  box-shadow: 0 0 7px rgba(34, 197, 94, 0.5);
+}
+
+/* Disconnected / reconnecting */
+#connection-badge.disconnected #connection-dot {
+  background: #ef4444;
+  box-shadow: 0 0 7px rgba(239, 68, 68, 0.4);
+  animation: pulse-red 1.4s ease-in-out infinite;
+}
+
+@keyframes pulse-red {
+  0%,
+  100% { opacity: 1; }
+  50%  { opacity: 0.35; }
+}
+
+#connection-label {
+  font-size: 11px;
+  letter-spacing: 1.5px;
+  font-weight: 300;
+  color: rgba(255, 255, 255, 0.3);
+  text-transform: lowercase;
+  transition: color 0.4s ease;
+}
+
+#connection-badge.connected #connection-label {
+  color: rgba(34, 197, 94, 0.7);
+}
+
+#connection-badge.disconnected #connection-label {
+  color: rgba(239, 68, 68, 0.6);
+}
+
+/* ── Mute button ───────────────────────────────────────────────────────────── */
+#mute-button {
+  position: fixed;
+  top: 18px;
+  left: 18px;
+  padding: 8px 14px;
+  border: 1px solid rgba(76, 168, 232, 0.16);
+  border-radius: 999px;
+  background: rgba(5, 5, 8, 0.34);
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 11px;
+  letter-spacing: 1.8px;
+  text-transform: uppercase;
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  cursor: pointer;
+  z-index: 20;
+  transition:
+    background 0.25s ease,
+    border-color 0.25s ease,
+    color 0.25s ease,
+    box-shadow 0.25s ease,
+    opacity 0.25s ease;
+}
+
+#mute-button:hover {
+  background: rgba(5, 5, 8, 0.5);
+  color: rgba(255, 255, 255, 0.72);
+  border-color: rgba(76, 168, 232, 0.28);
+}
+
+#mute-button:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(76, 168, 232, 0.18);
+}
+
+#mute-button.is-muted {
+  background: rgba(239, 68, 68, 0.12);
+  border-color: rgba(239, 68, 68, 0.26);
+  color: rgba(255, 160, 160, 0.9);
+  box-shadow: 0 0 18px rgba(239, 68, 68, 0.14);
+}
+
+/* ── Error toast ──────────────────────────────────────────────────────────── */
+#error-text {
+  position: fixed;
+  top: 18px;
+  left: 50%;
+  transform: translateX(-50%);
+  color: rgba(239, 68, 68, 0.8);
+  font-size: 12px;
+  letter-spacing: 1px;
+  font-weight: 300;
+  pointer-events: none;
+  z-index: 30;
+  opacity: 0;
+  transition: opacity 0.4s ease;
+  white-space: nowrap;
+}
