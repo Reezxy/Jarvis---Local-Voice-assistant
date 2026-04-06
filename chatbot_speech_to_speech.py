@@ -3,7 +3,7 @@ Local Voice Assistant — Jarvis Edition
 ─────────────────────────────────────────────────────────────────────────────
 LLM  : Llama-3.2-3B-Instruct Q4_K_M via llama-cpp-python (Apple Metal GPU)
 TTS  : Kokoro-82M ONNX  ·  voice: am_fenrir (EN)  ·  ~200 ms/sentence
-       Piper TTS de_DE-thorsten-high (DE, lazy-loaded on first DE request)
+       Kokoro-German (KPipeline lang_code='d') ·  df_eva / dm_bernd (DE)
 STT  : faster-whisper 'small' + int8 quantisation + VAD filter
 ─────────────────────────────────────────────────────────────────────────────
 Pipeline   : LLM-stream → TTS-stream → SeamlessPlayer (zero-gap audio)
@@ -37,8 +37,7 @@ import ws_server
 # ── Constants ─────────────────────────────────────────────────────────────────
 CONFIG_PATH  = Path(__file__).parent / "config.json"
 SAMPLE_RATE  = 16_000
-TTS_RATE     = 24_000          # kokoro (EN)
-TTS_RATE_DE  = 22_050          # piper thorsten-high (DE)
+TTS_RATE     = 24_000          # kokoro (EN + DE — same model architecture)
 
 # German persona prompt (used when lang == "de")
 _DE_PROMPT = (
@@ -187,9 +186,10 @@ class VoiceAssistant:
         self.system_prompt: str = self._en_prompt
         self._stop_speak = threading.Event()
 
-        # German TTS (Piper) — loaded lazily on first DE switch
-        self._piper_voice = None
-        self._tts_rate: int = TTS_RATE  # updated on language switch
+        # German TTS (Kokoro KPipeline) — loaded lazily on first DE switch
+        self._kokoro_de_pipeline = None
+        self._de_voice: str = self.cfg.get("tts", {}).get("de_voice", "dm_bernd")
+        self._tts_rate: int = TTS_RATE  # same for EN and DE (24 kHz)
 
         # Sync initial lang from config / ws_server
         initial_lang = self.cfg.get("lang", "en")
@@ -253,39 +253,36 @@ class VoiceAssistant:
         self._lang: str = c.get("language", "en")   # STT + active language
         print("[STT] Ready")
 
-    def _load_piper(self) -> None:
-        """Lazy-load Piper TTS for German (de_DE-thorsten-high)."""
-        print("[TTS-DE] Loading Piper de_DE-thorsten-high …")
+    def _load_kokoro_de(self) -> None:
+        """Lazy-load Kokoro-German KPipeline (first DE switch only)."""
+        print(f"[TTS-DE] Loading Kokoro-German  (voice: {self._de_voice}) …")
         try:
-            from piper import PiperVoice  # type: ignore
+            import os as _os
+            _os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+            from kokoro import KPipeline  # type: ignore
         except ImportError:
-            print("[TTS-DE] piper-tts not installed — run: pip install piper-tts")
+            print("[TTS-DE] kokoro not installed — run: pip install 'kokoro[de]'")
             return
-        onnx_path = Path(hf_hub_download(
-            "rhasspy/piper-voices",
-            "de/de_DE/thorsten/high/de_DE-thorsten-high.onnx",
-        ))
-        # also warm up the config JSON in cache (co-located in HF snapshot)
-        hf_hub_download(
-            "rhasspy/piper-voices",
-            "de/de_DE/thorsten/high/de_DE-thorsten-high.onnx.json",
-        )
-        self._piper_voice = PiperVoice.load(str(onnx_path))
-        print(f"[TTS-DE] Ready  (sample_rate={self._piper_voice.config.sample_rate})")
+        try:
+            self._kokoro_de_pipeline = KPipeline(lang_code="d", repo_id="Tundragoon/Kokoro-German")
+            print(f"[TTS-DE] Ready  (Kokoro-German, 24 kHz, voice={self._de_voice})")
+        except Exception as exc:
+            print(f"[TTS-DE] Failed to load: {exc}")
+            self._kokoro_de_pipeline = None
 
     # ── Language switching ────────────────────────────────────────────────────
 
     def _apply_lang_de(self, announce: bool = True) -> None:
         """Switch all sub-systems to German."""
-        if self._piper_voice is None:
-            self._load_piper()
-        if self._piper_voice is None:
-            print("[LANG] Piper unavailable — staying in English")
+        if self._kokoro_de_pipeline is None:
+            self._load_kokoro_de()
+        if self._kokoro_de_pipeline is None:
+            print("[LANG] Kokoro-DE unavailable — staying in English")
             return
-        self._lang       = "de"
-        self._tts_rate   = self._piper_voice.config.sample_rate
+        self._lang         = "de"
+        self._tts_rate     = TTS_RATE  # 24 kHz (same as EN)
         self.system_prompt = _DE_PROMPT
-        self.history.clear()  # reset context; prompts differ
+        self.history.clear()
         ws_server.set_lang("de")
         print("[LANG] ✓ Switched to German (DE)")
         if announce:
@@ -391,12 +388,13 @@ class VoiceAssistant:
     # ── TTS ───────────────────────────────────────────────────────────────────
 
     def _synthesise(self, text: str) -> np.ndarray:
-        if self._lang == "de" and self._piper_voice is not None:
-            # Piper: collect int16 chunks → float32
-            chunks = list(self._piper_voice.synthesize(text))
-            audio_bytes = b"".join(c.audio_int16_bytes for c in chunks)
-            return np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-        # Default: Kokoro (English)
+        if self._lang == "de" and self._kokoro_de_pipeline is not None:
+            # Kokoro-German: generator yields (graphemes, phonemes, audio) per clause
+            parts: list[np.ndarray] = []
+            for _, _, audio in self._kokoro_de_pipeline(text, voice=self._de_voice):
+                parts.append(np.asarray(audio, dtype=np.float32))
+            return np.concatenate(parts) if parts else np.zeros(1, dtype=np.float32)
+        # Default: Kokoro ONNX (English)
         samples, _ = self._kokoro.create(
             text, voice=self._voice, speed=self._speed, lang="en-us"
         )

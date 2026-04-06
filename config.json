@@ -15,6 +15,7 @@
     "model_file": "kokoro-v1.0.onnx",
     "voices_file": "voices-v1.0.bin",
     "voice": "am_fenrir",
+    "de_voice": "dm_bernd",
     "speed": 1.0
   },
   "stt": {
