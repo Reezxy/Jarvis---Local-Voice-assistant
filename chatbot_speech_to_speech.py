@@ -2,11 +2,13 @@
 Local Voice Assistant — Jarvis Edition
 ─────────────────────────────────────────────────────────────────────────────
 LLM  : Llama-3.2-3B-Instruct Q4_K_M via llama-cpp-python (Apple Metal GPU)
-TTS  : Kokoro-82M ONNX  ·  voice: am_fenrir (male)  ·  ~200 ms/sentence
-STT  : faster-whisper 'base' + int8 quantisation + VAD filter
+TTS  : Kokoro-82M ONNX  ·  voice: am_fenrir (EN)  ·  ~200 ms/sentence
+       Piper TTS de_DE-thorsten-high (DE, lazy-loaded on first DE request)
+STT  : faster-whisper 'small' + int8 quantisation + VAD filter
 ─────────────────────────────────────────────────────────────────────────────
 Pipeline   : LLM-stream → TTS-stream → SeamlessPlayer (zero-gap audio)
 System cmds: volume, apps, screenshot, timer — executed locally, no LLM
+Language   : switch via UI toggle (EN ↔ DE); STT + TTS + prompt all switch
 """
 
 import json
@@ -33,9 +35,22 @@ from llama_cpp import Llama
 import ws_server
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-CONFIG_PATH = Path(__file__).parent / "config.json"
+CONFIG_PATH  = Path(__file__).parent / "config.json"
 SAMPLE_RATE  = 16_000
-TTS_RATE     = 24_000
+TTS_RATE     = 24_000          # kokoro (EN)
+TTS_RATE_DE  = 22_050          # piper thorsten-high (DE)
+
+# German persona prompt (used when lang == "de")
+_DE_PROMPT = (
+    "Du bist Jarvis, ein brillanter und präziser KI-Assistent. "
+    "Dein Name ist Jarvis. Der Nutzer heißt Felix. "
+    "Sprich ihn natürlich als 'Sir' oder 'Felix' an — bevorzuge 'Sir' bei kurzen Antworten. "
+    "Falls du nach deinem Namen gefragt wirst, sage Jarvis. "
+    "Antworte immer auf Deutsch. Halte Antworten kurz, gesprächig und natürlich. "
+    "Keine Aufzählungen, kein Markdown. "
+    "Du kannst den Mac des Nutzers steuern: Apps öffnen/beenden, Lautstärke, "
+    "Screenshots, Timer setzen."
+)
 FRAME_MS     = 30
 FRAME_SIZE   = int(SAMPLE_RATE * FRAME_MS / 1_000)
 
@@ -161,7 +176,7 @@ class VoiceAssistant:
         self.vad = webrtcvad.Vad(3)
         self._audio_q: queue.Queue[bytes] = queue.Queue()
         self.history: list[dict] = []
-        self.system_prompt: str = self.cfg["llm"].get(
+        self._en_prompt: str = self.cfg["llm"].get(
             "prompt_behavior",
             "You are Jarvis, a helpful and concise voice assistant. "
             "Your name is Jarvis. The user's name is Felix. "
@@ -169,7 +184,18 @@ class VoiceAssistant:
             "If asked for your name, say your name is Jarvis. "
             "Keep answers brief and conversational. No bullet points or markdown.",
         )
+        self.system_prompt: str = self._en_prompt
         self._stop_speak = threading.Event()
+
+        # German TTS (Piper) — loaded lazily on first DE switch
+        self._piper_voice = None
+        self._tts_rate: int = TTS_RATE  # updated on language switch
+
+        # Sync initial lang from config / ws_server
+        initial_lang = self.cfg.get("lang", "en")
+        ws_server.set_lang(initial_lang)
+        if initial_lang == "de":
+            self._apply_lang_de(announce=False)
 
     # ── Loading ───────────────────────────────────────────────────────────────
 
@@ -224,8 +250,66 @@ class VoiceAssistant:
             self._stt = WhisperModel(
                 size, device="cpu", compute_type="int8", local_files_only=True
             )
-        self._lang: str = c.get("language", "en")
+        self._lang: str = c.get("language", "en")   # STT + active language
         print("[STT] Ready")
+
+    def _load_piper(self) -> None:
+        """Lazy-load Piper TTS for German (de_DE-thorsten-high)."""
+        print("[TTS-DE] Loading Piper de_DE-thorsten-high …")
+        try:
+            from piper import PiperVoice  # type: ignore
+        except ImportError:
+            print("[TTS-DE] piper-tts not installed — run: pip install piper-tts")
+            return
+        onnx_path = Path(hf_hub_download(
+            "rhasspy/piper-voices",
+            "de/de_DE/thorsten/high/de_DE-thorsten-high.onnx",
+        ))
+        # also warm up the config JSON in cache (co-located in HF snapshot)
+        hf_hub_download(
+            "rhasspy/piper-voices",
+            "de/de_DE/thorsten/high/de_DE-thorsten-high.onnx.json",
+        )
+        self._piper_voice = PiperVoice.load(str(onnx_path))
+        print(f"[TTS-DE] Ready  (sample_rate={self._piper_voice.config.sample_rate})")
+
+    # ── Language switching ────────────────────────────────────────────────────
+
+    def _apply_lang_de(self, announce: bool = True) -> None:
+        """Switch all sub-systems to German."""
+        if self._piper_voice is None:
+            self._load_piper()
+        if self._piper_voice is None:
+            print("[LANG] Piper unavailable — staying in English")
+            return
+        self._lang       = "de"
+        self._tts_rate   = self._piper_voice.config.sample_rate
+        self.system_prompt = _DE_PROMPT
+        self.history.clear()  # reset context; prompts differ
+        ws_server.set_lang("de")
+        print("[LANG] ✓ Switched to German (DE)")
+        if announce:
+            self.speak_direct("Alles klar, ich spreche jetzt Deutsch.")
+
+    def _apply_lang_en(self, announce: bool = True) -> None:
+        """Switch all sub-systems back to English."""
+        self._lang       = "en"
+        self._tts_rate   = TTS_RATE
+        self.system_prompt = self._en_prompt
+        self.history.clear()
+        ws_server.set_lang("en")
+        print("[LANG] ✓ Switched to English (EN)")
+        if announce:
+            self.speak_direct("Alright, switching back to English.")
+
+    def _check_lang_switch(self) -> None:
+        """Called each loop iteration — syncs to UI lang toggle if changed."""
+        ui_lang = ws_server.get_lang()
+        if ui_lang != self._lang:
+            if ui_lang == "de":
+                self._apply_lang_de()
+            else:
+                self._apply_lang_en()
 
     # ── Audio helpers ─────────────────────────────────────────────────────────
 
@@ -307,6 +391,12 @@ class VoiceAssistant:
     # ── TTS ───────────────────────────────────────────────────────────────────
 
     def _synthesise(self, text: str) -> np.ndarray:
+        if self._lang == "de" and self._piper_voice is not None:
+            # Piper: collect int16 chunks → float32
+            chunks = list(self._piper_voice.synthesize(text))
+            audio_bytes = b"".join(c.audio_int16_bytes for c in chunks)
+            return np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        # Default: Kokoro (English)
         samples, _ = self._kokoro.create(
             text, voice=self._voice, speed=self._speed, lang="en-us"
         )
@@ -317,7 +407,7 @@ class VoiceAssistant:
         ws_server.set_state("speaking")
         try:
             wav    = self._synthesise(text)
-            player = SeamlessPlayer(sample_rate=TTS_RATE)
+            player = SeamlessPlayer(sample_rate=self._tts_rate)
             player.start()
             player.feed(wav)
             player.mark_done()
@@ -721,7 +811,7 @@ class VoiceAssistant:
         ws_server.set_state("thinking")
 
         sentence_q: queue.Queue[Optional[str]] = queue.Queue()
-        player = SeamlessPlayer(sample_rate=TTS_RATE)
+        player = SeamlessPlayer(sample_rate=self._tts_rate)
         player.start()
 
         first_audio_ready = threading.Event()
@@ -787,6 +877,9 @@ class VoiceAssistant:
 
         while True:
             try:
+                # Sync language if the UI toggle changed
+                self._check_lang_switch()
+
                 if ws_server.is_muted():
                     ws_server.set_state("idle")
                     time.sleep(0.1)

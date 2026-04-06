@@ -171,6 +171,56 @@ body {
   box-shadow: 0 0 18px rgba(239, 68, 68, 0.14);
 }
 
+/* ── Language toggle ─────────────────────────────────────────────────────── */
+#lang-button {
+  position: fixed;
+  top: 18px;
+  left: 90px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 8px 14px;
+  border: 1px solid rgba(76, 168, 232, 0.16);
+  border-radius: 999px;
+  background: rgba(5, 5, 8, 0.34);
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 11px;
+  letter-spacing: 1.8px;
+  text-transform: uppercase;
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  cursor: pointer;
+  z-index: 20;
+  transition:
+    background 0.25s ease,
+    border-color 0.25s ease,
+    color 0.25s ease,
+    box-shadow 0.25s ease;
+}
+
+#lang-button:hover {
+  background: rgba(5, 5, 8, 0.5);
+  color: rgba(255, 255, 255, 0.72);
+  border-color: rgba(76, 168, 232, 0.28);
+}
+
+#lang-button:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(76, 168, 232, 0.18);
+}
+
+#lang-button[data-lang="de"] {
+  background: rgba(30, 80, 30, 0.18);
+  border-color: rgba(100, 200, 100, 0.26);
+  color: rgba(160, 240, 160, 0.9);
+  box-shadow: 0 0 18px rgba(100, 200, 100, 0.12);
+}
+
+#lang-flag {
+  font-size: 13px;
+  line-height: 1;
+}
+
 /* ── Error toast ──────────────────────────────────────────────────────────── */
 #error-text {
   position: fixed;

@@ -1,6 +1,7 @@
 llama-cpp-python
 kokoro-onnx
 faster-whisper
+piper-tts
 sounddevice
 webrtcvad
 numpy

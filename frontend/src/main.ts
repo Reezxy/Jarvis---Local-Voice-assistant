@@ -23,21 +23,36 @@ const badgeLabelEl = document.getElementById(
   "connection-label"
 ) as HTMLSpanElement;
 const muteButtonEl = document.getElementById("mute-button") as HTMLButtonElement;
+const langButtonEl = document.getElementById("lang-button") as HTMLButtonElement;
+const langFlagEl   = document.getElementById("lang-flag")   as HTMLSpanElement;
+const langLabelEl  = document.getElementById("lang-label")  as HTMLSpanElement;
 
 // ── Orb ───────────────────────────────────────────────────────────────────────
 const orb = createOrb(canvas);
 
-// ── State labels ──────────────────────────────────────────────────────────────
-const STATE_LABELS: Record<OrbState, string> = {
-  idle: "",
-  listening: "listening...",
-  thinking: "thinking...",
-  speaking: "",
+// ── Language ──────────────────────────────────────────────────────────────────
+let currentLang: "en" | "de" = "en";
+
+const STATE_LABELS: Record<"en" | "de", Record<OrbState, string>> = {
+  en: { idle: "", listening: "listening...", thinking: "thinking...", speaking: "" },
+  de: { idle: "", listening: "zuhören...", thinking: "denken...", speaking: "" },
 };
+
+function setLang(lang: "en" | "de"): void {
+  currentLang = lang;
+  langButtonEl.setAttribute("data-lang", lang);
+  if (lang === "de") {
+    langFlagEl.textContent  = "🇩🇪";
+    langLabelEl.textContent = "DE";
+  } else {
+    langFlagEl.textContent  = "🇺🇸";
+    langLabelEl.textContent = "EN";
+  }
+}
 
 function applyState(state: OrbState): void {
   orb.setState(state);
-  statusEl.textContent = STATE_LABELS[state];
+  statusEl.textContent = STATE_LABELS[currentLang][state];
 }
 
 function setMuted(muted: boolean): void {
@@ -70,15 +85,36 @@ async function refreshStatus(): Promise<void> {
   try {
     const res = await fetch("http://localhost:3000/api/status");
     if (!res.ok) return;
-    const data = (await res.json()) as { state?: string; muted?: boolean };
+    const data = (await res.json()) as { state?: string; muted?: boolean; lang?: string };
     if (data.state) {
       applyState(data.state as OrbState);
     }
     if (typeof data.muted === "boolean") {
       setMuted(data.muted);
     }
+    if (data.lang === "en" || data.lang === "de") {
+      setLang(data.lang);
+    }
   } catch {
     // backend offline, keep UI defaults
+  }
+}
+
+async function toggleLang(): Promise<void> {
+  const nextLang = currentLang === "en" ? "de" : "en";
+  try {
+    const res = await fetch("http://localhost:3000/api/lang", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ lang: nextLang }),
+    });
+    if (!res.ok) throw new Error("lang request failed");
+    const data = (await res.json()) as { lang?: string };
+    if (data.lang === "en" || data.lang === "de") {
+      setLang(data.lang);
+    }
+  } catch {
+    showError("language switch failed");
   }
 }
 
@@ -128,6 +164,7 @@ function connect(): void {
       const data = JSON.parse(event.data as string) as {
         state?: string;
         muted?: boolean;
+        lang?: string;
         action?: string;
       };
       if (data.action === "demo") {
@@ -139,6 +176,9 @@ function connect(): void {
       }
       if (typeof data.muted === "boolean") {
         setMuted(data.muted);
+      }
+      if (data.lang === "en" || data.lang === "de") {
+        setLang(data.lang);
       }
     } catch {
       // ignore malformed messages
@@ -169,11 +209,8 @@ function scheduleReconnect(): void {
 setConnected(false);
 applyState("idle");
 setMuted(false);
+setLang("en");
 void refreshStatus();
 connect();
-muteButtonEl.addEventListener("click", () => {
-  void toggleMuted();
-});
-
-// Silence unused-import warning for showError — will be useful for future extensions
-void showError;
+muteButtonEl.addEventListener("click", () => { void toggleMuted(); });
+langButtonEl.addEventListener("click", () => { void toggleLang(); });
