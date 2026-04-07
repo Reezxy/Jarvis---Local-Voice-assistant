@@ -34,7 +34,6 @@ _clients: Set[WebSocketServerProtocol] = set()
 _loop: asyncio.AbstractEventLoop | None = None
 _current_state: str = "idle"
 _muted: bool = False
-_lang: str = "en"
 _state_lock = threading.Lock()
 
 logger = logging.getLogger(__name__)
@@ -46,17 +45,17 @@ async def _handler(ws: WebSocketServerProtocol) -> None:
     _clients.add(ws)
     try:
         # Send current state immediately so the UI is in sync on connect
-        await ws.send(json.dumps({"state": _current_state, "muted": _muted, "lang": _lang}))
+        await ws.send(json.dumps({"state": _current_state, "muted": _muted}))
         # Keep connection alive; we don't expect messages from the browser
         await ws.wait_closed()
     finally:
         _clients.discard(ws)
 
 
-async def _broadcast(state: str, muted: bool, lang: str) -> None:
+async def _broadcast(state: str, muted: bool) -> None:
     if not _clients:
         return
-    message = json.dumps({"state": state, "muted": muted, "lang": lang})
+    message = json.dumps({"state": state, "muted": muted})
     await asyncio.gather(
         *[ws.send(message) for ws in list(_clients)],
         return_exceptions=True,
@@ -76,10 +75,9 @@ def set_state(state: str) -> None:
     with _state_lock:
         _current_state = state
         muted = _muted
-        lang  = _lang
     if _loop is None:
         return
-    asyncio.run_coroutine_threadsafe(_broadcast(state, muted, lang), _loop)
+    asyncio.run_coroutine_threadsafe(_broadcast(state, muted), _loop)
 
 
 def send_event(event: dict) -> None:
@@ -105,10 +103,9 @@ def set_muted(muted: bool) -> None:
     with _state_lock:
         _muted = muted
         state = _current_state
-        lang  = _lang
     if _loop is None:
         return
-    asyncio.run_coroutine_threadsafe(_broadcast(state, muted, lang), _loop)
+    asyncio.run_coroutine_threadsafe(_broadcast(state, muted), _loop)
 
 
 def is_muted() -> bool:
@@ -116,26 +113,9 @@ def is_muted() -> bool:
         return _muted
 
 
-def set_lang(lang: str) -> None:
-    """Update active language and broadcast to all clients (thread-safe)."""
-    global _lang
-    with _state_lock:
-        _lang  = lang
-        state  = _current_state
-        muted  = _muted
-    if _loop is None:
-        return
-    asyncio.run_coroutine_threadsafe(_broadcast(state, muted, lang), _loop)
-
-
-def get_lang() -> str:
-    with _state_lock:
-        return _lang
-
-
 def get_status() -> dict[str, str | bool]:
     with _state_lock:
-        return {"state": _current_state, "muted": _muted, "lang": _lang}
+        return {"state": _current_state, "muted": _muted}
 
 
 def _serve_http() -> None:
@@ -166,43 +146,26 @@ def _serve_http() -> None:
             super().do_GET()
 
         def do_POST(self):
+            if self.path != "/api/mute":
+                self.send_error(404)
+                return
+
             length = int(self.headers.get("Content-Length", "0"))
             raw = self.rfile.read(length) if length > 0 else b"{}"
+            try:
+                data = json.loads(raw.decode("utf-8"))
+                muted = bool(data["muted"])
+            except (json.JSONDecodeError, KeyError, TypeError):
+                self.send_error(400, "Invalid mute payload")
+                return
 
-            if self.path == "/api/mute":
-                try:
-                    data = json.loads(raw.decode("utf-8"))
-                    muted = bool(data["muted"])
-                except (json.JSONDecodeError, KeyError, TypeError):
-                    self.send_error(400, "Invalid mute payload")
-                    return
-                set_muted(muted)
-                body = json.dumps(get_status()).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-            elif self.path == "/api/lang":
-                try:
-                    data = json.loads(raw.decode("utf-8"))
-                    new_lang = str(data["lang"]).lower()
-                    if new_lang not in ("en", "de"):
-                        raise ValueError
-                except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-                    self.send_error(400, "Invalid lang payload (use 'en' or 'de')")
-                    return
-                set_lang(new_lang)
-                body = json.dumps(get_status()).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-            else:
-                self.send_error(404)
+            set_muted(muted)
+            body = json.dumps(get_status()).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
         def end_headers(self):
             # Allow WebSocket connections from the same origin

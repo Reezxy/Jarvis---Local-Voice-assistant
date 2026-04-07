@@ -2,13 +2,11 @@
 Local Voice Assistant — Jarvis Edition
 ─────────────────────────────────────────────────────────────────────────────
 LLM  : Llama-3.2-3B-Instruct Q4_K_M via llama-cpp-python (Apple Metal GPU)
-TTS  : Kokoro-82M ONNX  ·  voice: am_fenrir (EN)  ·  ~200 ms/sentence
-       Kokoro-German (KPipeline lang_code='d') ·  df_eva / dm_bernd (DE)
-STT  : faster-whisper 'small' + int8 quantisation + VAD filter
+TTS  : Kokoro-82M ONNX  ·  voice: am_fenrir (male)  ·  ~200 ms/sentence
+STT  : faster-whisper 'base' + int8 quantisation + VAD filter
 ─────────────────────────────────────────────────────────────────────────────
 Pipeline   : LLM-stream → TTS-stream → SeamlessPlayer (zero-gap audio)
 System cmds: volume, apps, screenshot, timer — executed locally, no LLM
-Language   : switch via UI toggle (EN ↔ DE); STT + TTS + prompt all switch
 """
 
 import json
@@ -35,21 +33,9 @@ from llama_cpp import Llama
 import ws_server
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-CONFIG_PATH  = Path(__file__).parent / "config.json"
+CONFIG_PATH = Path(__file__).parent / "config.json"
 SAMPLE_RATE  = 16_000
-TTS_RATE     = 24_000          # kokoro (EN + DE — same model architecture)
-
-# German persona prompt (used when lang == "de")
-_DE_PROMPT = (
-    "Du bist Jarvis, ein brillanter und präziser KI-Assistent. "
-    "Dein Name ist Jarvis. Der Nutzer heißt Felix. "
-    "Sprich ihn natürlich als 'Sir' oder 'Felix' an — bevorzuge 'Sir' bei kurzen Antworten. "
-    "Falls du nach deinem Namen gefragt wirst, sage Jarvis. "
-    "Antworte immer auf Deutsch. Halte Antworten kurz, gesprächig und natürlich. "
-    "Keine Aufzählungen, kein Markdown. "
-    "Du kannst den Mac des Nutzers steuern: Apps öffnen/beenden, Lautstärke, "
-    "Screenshots, Timer setzen."
-)
+TTS_RATE     = 24_000
 FRAME_MS     = 30
 FRAME_SIZE   = int(SAMPLE_RATE * FRAME_MS / 1_000)
 
@@ -175,7 +161,7 @@ class VoiceAssistant:
         self.vad = webrtcvad.Vad(3)
         self._audio_q: queue.Queue[bytes] = queue.Queue()
         self.history: list[dict] = []
-        self._en_prompt: str = self.cfg["llm"].get(
+        self.system_prompt: str = self.cfg["llm"].get(
             "prompt_behavior",
             "You are Jarvis, a helpful and concise voice assistant. "
             "Your name is Jarvis. The user's name is Felix. "
@@ -183,19 +169,7 @@ class VoiceAssistant:
             "If asked for your name, say your name is Jarvis. "
             "Keep answers brief and conversational. No bullet points or markdown.",
         )
-        self.system_prompt: str = self._en_prompt
         self._stop_speak = threading.Event()
-
-        # German TTS (Kokoro KPipeline) — loaded lazily on first DE switch
-        self._kokoro_de_pipeline = None
-        self._de_voice: str = self.cfg.get("tts", {}).get("de_voice", "dm_bernd")
-        self._tts_rate: int = TTS_RATE  # same for EN and DE (24 kHz)
-
-        # Sync initial lang from config / ws_server
-        initial_lang = self.cfg.get("lang", "en")
-        ws_server.set_lang(initial_lang)
-        if initial_lang == "de":
-            self._apply_lang_de(announce=False)
 
     # ── Loading ───────────────────────────────────────────────────────────────
 
@@ -250,63 +224,8 @@ class VoiceAssistant:
             self._stt = WhisperModel(
                 size, device="cpu", compute_type="int8", local_files_only=True
             )
-        self._lang: str = c.get("language", "en")   # STT + active language
+        self._lang: str = c.get("language", "en")
         print("[STT] Ready")
-
-    def _load_kokoro_de(self) -> None:
-        """Lazy-load Kokoro-German KPipeline (first DE switch only)."""
-        print(f"[TTS-DE] Loading Kokoro-German  (voice: {self._de_voice}) …")
-        try:
-            import os as _os
-            _os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-            from kokoro import KPipeline  # type: ignore
-        except ImportError:
-            print("[TTS-DE] kokoro not installed — run: pip install 'kokoro[de]'")
-            return
-        try:
-            self._kokoro_de_pipeline = KPipeline(lang_code="d", repo_id="Tundragoon/Kokoro-German")
-            print(f"[TTS-DE] Ready  (Kokoro-German, 24 kHz, voice={self._de_voice})")
-        except Exception as exc:
-            print(f"[TTS-DE] Failed to load: {exc}")
-            self._kokoro_de_pipeline = None
-
-    # ── Language switching ────────────────────────────────────────────────────
-
-    def _apply_lang_de(self, announce: bool = True) -> None:
-        """Switch all sub-systems to German."""
-        if self._kokoro_de_pipeline is None:
-            self._load_kokoro_de()
-        if self._kokoro_de_pipeline is None:
-            print("[LANG] Kokoro-DE unavailable — staying in English")
-            return
-        self._lang         = "de"
-        self._tts_rate     = TTS_RATE  # 24 kHz (same as EN)
-        self.system_prompt = _DE_PROMPT
-        self.history.clear()
-        ws_server.set_lang("de")
-        print("[LANG] ✓ Switched to German (DE)")
-        if announce:
-            self.speak_direct("Alles klar, ich spreche jetzt Deutsch.")
-
-    def _apply_lang_en(self, announce: bool = True) -> None:
-        """Switch all sub-systems back to English."""
-        self._lang       = "en"
-        self._tts_rate   = TTS_RATE
-        self.system_prompt = self._en_prompt
-        self.history.clear()
-        ws_server.set_lang("en")
-        print("[LANG] ✓ Switched to English (EN)")
-        if announce:
-            self.speak_direct("Alright, switching back to English.")
-
-    def _check_lang_switch(self) -> None:
-        """Called each loop iteration — syncs to UI lang toggle if changed."""
-        ui_lang = ws_server.get_lang()
-        if ui_lang != self._lang:
-            if ui_lang == "de":
-                self._apply_lang_de()
-            else:
-                self._apply_lang_en()
 
     # ── Audio helpers ─────────────────────────────────────────────────────────
 
@@ -388,13 +307,6 @@ class VoiceAssistant:
     # ── TTS ───────────────────────────────────────────────────────────────────
 
     def _synthesise(self, text: str) -> np.ndarray:
-        if self._lang == "de" and self._kokoro_de_pipeline is not None:
-            # Kokoro-German: generator yields (graphemes, phonemes, audio) per clause
-            parts: list[np.ndarray] = []
-            for _, _, audio in self._kokoro_de_pipeline(text, voice=self._de_voice):
-                parts.append(np.asarray(audio, dtype=np.float32))
-            return np.concatenate(parts) if parts else np.zeros(1, dtype=np.float32)
-        # Default: Kokoro ONNX (English)
         samples, _ = self._kokoro.create(
             text, voice=self._voice, speed=self._speed, lang="en-us"
         )
@@ -405,7 +317,7 @@ class VoiceAssistant:
         ws_server.set_state("speaking")
         try:
             wav    = self._synthesise(text)
-            player = SeamlessPlayer(sample_rate=self._tts_rate)
+            player = SeamlessPlayer(sample_rate=TTS_RATE)
             player.start()
             player.feed(wav)
             player.mark_done()
@@ -809,7 +721,7 @@ class VoiceAssistant:
         ws_server.set_state("thinking")
 
         sentence_q: queue.Queue[Optional[str]] = queue.Queue()
-        player = SeamlessPlayer(sample_rate=self._tts_rate)
+        player = SeamlessPlayer(sample_rate=TTS_RATE)
         player.start()
 
         first_audio_ready = threading.Event()
@@ -875,9 +787,6 @@ class VoiceAssistant:
 
         while True:
             try:
-                # Sync language if the UI toggle changed
-                self._check_lang_switch()
-
                 if ws_server.is_muted():
                     ws_server.set_state("idle")
                     time.sleep(0.1)

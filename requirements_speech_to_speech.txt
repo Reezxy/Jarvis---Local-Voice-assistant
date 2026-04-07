@@ -1,6 +1,5 @@
 llama-cpp-python
 kokoro-onnx
-kokoro[de]
 faster-whisper
 sounddevice
 webrtcvad
