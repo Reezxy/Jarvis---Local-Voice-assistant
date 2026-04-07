@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import AVFoundation
+import AVFAudio
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -24,60 +25,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // MARK: - Microphone permission
+    // Use AVAudioApplication on macOS 14+ (the recommended API for subprocess attribution).
+    // Fall back to AVCaptureDevice on macOS 13.
 
     private func requestMicrophoneAccess() {
-        switch AVCaptureDevice.authorizationStatus(for: .audio) {
-
-        case .authorized:
-            runAudioProbe()
-
-        case .notDetermined:
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                AVCaptureDevice.requestAccess(for: .audio) { granted in
-                    DispatchQueue.main.async {
-                        if granted {
-                            self.runAudioProbe()
-                        } else {
-                            self.showMicDeniedAlert()
-                            self.backendManager.start()
+        if #available(macOS 14.0, *) {
+            switch AVAudioApplication.shared.recordPermission {
+            case .granted:
+                runAudioProbe()
+            case .undetermined:
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    AVAudioApplication.requestRecordPermission { granted in
+                        DispatchQueue.main.async {
+                            if granted { self.runAudioProbe() }
+                            else        { self.showMicDeniedAlert(); self.backendManager.start() }
                         }
                     }
                 }
+            case .denied:
+                showMicDeniedAlert()
+                backendManager.start()
+            @unknown default:
+                runAudioProbe()
             }
-
-        case .denied, .restricted:
-            backendManager.appendLog(
-                "⚠️  Microphone access denied for com.felix.jarvis.\n" +
-                "   → System Settings → Privacy & Security → Microphone → enable Jarvis\n" +
-                "   → Or reset via Terminal: tccutil reset Microphone com.felix.jarvis\n\n"
-            )
-            showMicDeniedAlert()
-            backendManager.start()
-
-        @unknown default:
-            backendManager.start()
+        } else {
+            // macOS 13 fallback
+            switch AVCaptureDevice.authorizationStatus(for: .audio) {
+            case .authorized:
+                runAudioProbe()
+            case .notDetermined:
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    AVCaptureDevice.requestAccess(for: .audio) { granted in
+                        DispatchQueue.main.async {
+                            if granted { self.runAudioProbe() }
+                            else        { self.showMicDeniedAlert(); self.backendManager.start() }
+                        }
+                    }
+                }
+            case .denied, .restricted:
+                showMicDeniedAlert()
+                backendManager.start()
+            @unknown default:
+                runAudioProbe()
+            }
         }
     }
 
     // MARK: - Audio probe
     //
-    // Runs a tiny Python snippet that opens the microphone for 0.15 s and
-    // immediately closes it.  Two purposes:
+    // Runs a 1-second Python snippet that:
+    //   1. Prints the selected input device name + sample rate
+    //   2. Records 1 s and prints the RMS level
+    //      → RMS ≈ 0  : device open but receiving silence (wrong device / TCC blocked)
+    //      → RMS > 50 : real audio arriving — VAD should work
     //
-    //  1. If macOS hasn't yet granted TCC access to the Python binary itself
-    //     (separate from the Swift app), it will show the system prompt here —
-    //     BEFORE the main script starts.
-    //
-    //  2. It verifies that sounddevice can actually open the device and records
-    //     the result in the logs.
-    //
-    // Note: we do NOT keep AVAudioEngine running in Swift.  That would hold the
-    // audio device at 44100 Hz and prevent Python/PortAudio from opening it at
-    // 16000 Hz — causing silent captures.
+    // This also warms up the Python binary's TCC attribution under Jarvis.app so
+    // the main script inherits it without a second dialog.
 
     private func runAudioProbe() {
-        let root      = backendManager.projectRoot
-        let python    = root + "/.venv311/bin/python"
+        let root   = backendManager.projectRoot
+        let python = root + "/.venv311/bin/python"
 
         guard FileManager.default.fileExists(atPath: python) else {
             backendManager.appendLog("⚠️  Python not found — skipping audio probe\n\n")
@@ -85,18 +92,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        let probe = """
-import sys
+        let probe = #"""
+import sys, time
 try:
-    import sounddevice as sd, time
+    import sounddevice as sd, numpy as np
+
     dev = sd.query_devices(kind='input')
-    print(f"[probe] input device: {dev['name']}  rate: {int(dev['default_samplerate'])} Hz", flush=True)
-    with sd.RawInputStream(samplerate=16000, blocksize=480, dtype='int16', channels=1):
-        time.sleep(0.15)
-    print("[probe] audio OK", flush=True)
+    print(f"[probe] device : {dev['name']}", flush=True)
+    print(f"[probe] hw rate: {int(dev['default_samplerate'])} Hz", flush=True)
+
+    frames = []
+    def _cb(data, n, t, s):
+        frames.append(bytes(data))
+
+    with sd.RawInputStream(samplerate=16000, blocksize=480,
+                           dtype='int16', channels=1, callback=_cb):
+        time.sleep(1.0)   # record for 1 second — speak now if you want to calibrate
+
+    if frames:
+        arr = np.frombuffer(b''.join(frames), dtype=np.int16).astype(np.float32)
+        rms = float(np.sqrt(np.mean(arr ** 2)))
+        status = "✅ audio OK" if rms > 50 else "⚠️  SILENT — wrong device or TCC blocked"
+        print(f"[probe] RMS    : {rms:.1f}  {status}", flush=True)
+    else:
+        print("[probe] ⚠️  no frames captured", flush=True)
+
 except Exception as e:
     print(f"[probe] ERROR: {e}", file=sys.stderr, flush=True)
-"""
+"""#
 
         let proc = Process()
         proc.executableURL       = URL(fileURLWithPath: python)
@@ -125,11 +148,11 @@ except Exception as e:
             }
         }
 
-        backendManager.appendLog("▶  Running audio probe…\n")
+        backendManager.appendLog("▶  Audio probe (1 s) — speak into the mic now to calibrate…\n")
         do {
             try proc.run()
         } catch {
-            backendManager.appendLog("Audio probe launch failed: \(error)\n")
+            backendManager.appendLog("Probe launch failed: \(error)\n")
             backendManager.start()
         }
     }
@@ -143,14 +166,14 @@ except Exception as e:
         alert.informativeText =
             "Jarvis can't hear you because microphone access was denied.\n\n" +
             "Open System Settings → Privacy & Security → Microphone and switch on Jarvis.\n\n" +
-            "If Jarvis doesn't appear in the list, run this once in Terminal:\n" +
-            "  tccutil reset Microphone com.felix.jarvis"
+            "If only 'JarvisApp' (old build, no icon) appears — disable it, then run:\n" +
+            "  tccutil reset Microphone com.felix.jarvis\n" +
+            "and relaunch Jarvis."
         alert.addButton(withTitle: "Open System Settings")
         alert.addButton(withTitle: "Ignore")
-
         if alert.runModal() == .alertFirstButtonReturn {
-            let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")!
-            NSWorkspace.shared.open(url)
+            NSWorkspace.shared.open(
+                URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")!)
         }
     }
 
@@ -169,18 +192,14 @@ except Exception as e:
     // MARK: - Logs window
 
     func showLogsWindow() {
-        if let w = logsWindow {
-            w.makeKeyAndOrderFront(nil)
-            return
-        }
+        if let w = logsWindow { w.makeKeyAndOrderFront(nil); return }
         let controller = NSHostingController(
             rootView: LogsView().environmentObject(backendManager)
         )
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 720, height: 480),
             styleMask: [.titled, .closable, .resizable, .miniaturizable],
-            backing: .buffered,
-            defer: false
+            backing: .buffered, defer: false
         )
         window.title = "Jarvis — Backend Logs"
         window.contentViewController = controller
