@@ -27,6 +27,12 @@ struct JarvisAppApp: App {
                     appDelegate.showLogsWindow()
                 }
                 .keyboardShortcut("l", modifiers: [.command, .shift])
+
+                Divider()
+
+                Button("Reset Mic Permission…") {
+                    appDelegate.resetMicrophonePermission()
+                }
             }
         }
     }

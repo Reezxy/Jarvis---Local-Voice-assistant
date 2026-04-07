@@ -8,12 +8,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     let backendManager = BackendManager()
     private var logsWindow: NSWindow?
+    /// Run the mic flow once; wait for a SwiftUI window so the system permission sheet can attach.
+    private var didScheduleMicrophoneFlow = false
+    /// Einmaliger Warmup, damit TCC / Mikrofon-Gerät wirklich angebunden wird (nicht nur requestAccess).
+    private var didRunMicCaptureWarmup = false
 
     // MARK: - NSApplicationDelegate
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.activate(ignoringOtherApps: true)
         configureMainWindow()
-        requestMicrophoneAccess()
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        guard !didScheduleMicrophoneFlow else { return }
+        didScheduleMicrophoneFlow = true
+        waitForWindowThenRequestMicrophone(retry: 0)
+    }
+
+    private func waitForWindowThenRequestMicrophone(retry: Int) {
+        if NSApp.windows.isEmpty, retry < 40 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                self.waitForWindowThenRequestMicrophone(retry: retry + 1)
+            }
+            return
+        }
+        DispatchQueue.main.async {
+            self.configureMainWindow()
+            // Python sofort; Mikrofon kurz verzögert, damit das System-Sheet nicht hinter dem Fenster hängt.
+            self.backendManager.start()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                self.requestMicrophoneAccess()
+                // Async-Callbacks von requestAccess können später feuern — nochmal prüfen.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+                    self.runMicCaptureWarmupIfAuthorized(reason: "verzögert nach Berechtigungs-Callbacks")
+                }
+            }
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -25,152 +56,170 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // MARK: - Microphone permission
-    // Use AVAudioApplication on macOS 14+ (the recommended API for subprocess attribution).
-    // Fall back to AVCaptureDevice on macOS 13.
+    //
+    // • AVCaptureDevice: klassischer Eintrag unter Datenschutz → Mikrofon.
+    // • AVAudioApplication (macOS 14+): Zuordnung für Audio/Unterprozesse (Python + sounddevice).
 
     private func requestMicrophoneAccess() {
+        NSApp.activate(ignoringOtherApps: true)
+        let front = NSApp.keyWindow ?? NSApp.mainWindow ?? NSApp.windows.first
+        front?.makeKeyAndOrderFront(nil)
+        NSApp.requestUserAttention(.informationalRequest)
+
+        let cap = AVCaptureDevice.authorizationStatus(for: .audio)
+        backendManager.appendLog("[Mic] AVCapture (Mikrofon): \(Self.describeCaptureStatus(cap))\n")
+
         if #available(macOS 14.0, *) {
-            switch AVAudioApplication.shared.recordPermission {
-            case .granted:
-                runAudioProbe()
-            case .undetermined:
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    AVAudioApplication.requestRecordPermission { granted in
-                        DispatchQueue.main.async {
-                            if granted { self.runAudioProbe() }
-                            else        { self.showMicDeniedAlert(); self.backendManager.start() }
-                        }
+            let rec = AVAudioApplication.shared.recordPermission
+            backendManager.appendLog("[Mic] AVAudioApplication (Aufnahme): \(Self.describeRecordPermission(rec))\n")
+            if cap == .denied || cap == .restricted || rec == .denied {
+                backendManager.appendLog("[Mic] Verweigert — kein System-Dialog mehr; Einstellungen oder tccutil reset.\n")
+                presentMicDeniedNeedsSettingsAlert()
+                return
+            }
+            if rec == .undetermined {
+                backendManager.appendLog("[Mic] Fordere AVAudioApplication.requestRecordPermission an …\n")
+                AVAudioApplication.requestRecordPermission { granted in
+                    DispatchQueue.main.async {
+                        self.backendManager.appendLog("[Mic] AVAudioApplication Ergebnis: \(granted ? "erlaubt" : "abgelehnt")\n")
+                        self.runMicCaptureWarmupIfAuthorized(reason: "nach AVAudioApplication")
                     }
                 }
-            case .denied:
-                showMicDeniedAlert()
-                backendManager.start()
-            @unknown default:
-                runAudioProbe()
             }
-        } else {
-            // macOS 13 fallback
-            switch AVCaptureDevice.authorizationStatus(for: .audio) {
-            case .authorized:
-                runAudioProbe()
-            case .notDetermined:
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    AVCaptureDevice.requestAccess(for: .audio) { granted in
-                        DispatchQueue.main.async {
-                            if granted { self.runAudioProbe() }
-                            else        { self.showMicDeniedAlert(); self.backendManager.start() }
-                        }
+            if cap == .notDetermined {
+                backendManager.appendLog("[Mic] Fordere AVCaptureDevice.requestAccess(audio) an …\n")
+                AVCaptureDevice.requestAccess(for: .audio) { granted in
+                    DispatchQueue.main.async {
+                        self.backendManager.appendLog("[Mic] AVCapture Ergebnis: \(granted ? "erlaubt" : "abgelehnt")\n")
+                        self.runMicCaptureWarmupIfAuthorized(reason: "nach AVCapture requestAccess")
                     }
                 }
-            case .denied, .restricted:
-                showMicDeniedAlert()
-                backendManager.start()
-            @unknown default:
-                runAudioProbe()
+            } else if cap == .authorized {
+                runMicCaptureWarmupIfAuthorized(reason: "AVCapture war schon authorized")
             }
-        }
-    }
-
-    // MARK: - Audio probe
-    //
-    // Runs a 1-second Python snippet that:
-    //   1. Prints the selected input device name + sample rate
-    //   2. Records 1 s and prints the RMS level
-    //      → RMS ≈ 0  : device open but receiving silence (wrong device / TCC blocked)
-    //      → RMS > 50 : real audio arriving — VAD should work
-    //
-    // This also warms up the Python binary's TCC attribution under Jarvis.app so
-    // the main script inherits it without a second dialog.
-
-    private func runAudioProbe() {
-        let root   = backendManager.projectRoot
-        let python = root + "/.venv311/bin/python"
-
-        guard FileManager.default.fileExists(atPath: python) else {
-            backendManager.appendLog("⚠️  Python not found — skipping audio probe\n\n")
-            backendManager.start()
             return
         }
 
-        let probe = #"""
-import sys, time
-try:
-    import sounddevice as sd, numpy as np
-
-    dev = sd.query_devices(kind='input')
-    print(f"[probe] device : {dev['name']}", flush=True)
-    print(f"[probe] hw rate: {int(dev['default_samplerate'])} Hz", flush=True)
-
-    frames = []
-    def _cb(data, n, t, s):
-        frames.append(bytes(data))
-
-    with sd.RawInputStream(samplerate=16000, blocksize=480,
-                           dtype='int16', channels=1, callback=_cb):
-        time.sleep(1.0)   # record for 1 second — speak now if you want to calibrate
-
-    if frames:
-        arr = np.frombuffer(b''.join(frames), dtype=np.int16).astype(np.float32)
-        rms = float(np.sqrt(np.mean(arr ** 2)))
-        status = "✅ audio OK" if rms > 50 else "⚠️  SILENT — wrong device or TCC blocked"
-        print(f"[probe] RMS    : {rms:.1f}  {status}", flush=True)
-    else:
-        print("[probe] ⚠️  no frames captured", flush=True)
-
-except Exception as e:
-    print(f"[probe] ERROR: {e}", file=sys.stderr, flush=True)
-"""#
-
-        let proc = Process()
-        proc.executableURL       = URL(fileURLWithPath: python)
-        proc.arguments           = ["-c", probe]
-        proc.currentDirectoryURL = URL(fileURLWithPath: root)
-
-        var env = ProcessInfo.processInfo.environment
-        env["PYTHONUNBUFFERED"] = "1"
-        proc.environment = env
-
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        proc.standardError  = pipe
-
-        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            guard !data.isEmpty, let str = String(data: data, encoding: .utf8) else { return }
-            Task { @MainActor [weak self] in self?.backendManager.appendLog(str) }
-        }
-
-        proc.terminationHandler = { [weak self] _ in
-            pipe.fileHandleForReading.readabilityHandler = nil
-            Task { @MainActor [weak self] in
-                self?.backendManager.appendLog("\n")
-                self?.backendManager.start()
+        switch cap {
+        case .authorized:
+            runMicCaptureWarmupIfAuthorized(reason: "AVCapture war schon authorized")
+        case .notDetermined:
+            backendManager.appendLog("[Mic] Fordere AVCaptureDevice.requestAccess(audio) an …\n")
+            AVCaptureDevice.requestAccess(for: .audio) { granted in
+                DispatchQueue.main.async {
+                    self.backendManager.appendLog("[Mic] AVCapture Ergebnis: \(granted ? "erlaubt" : "abgelehnt")\n")
+                    self.runMicCaptureWarmupIfAuthorized(reason: "nach AVCapture requestAccess")
+                }
             }
-        }
-
-        backendManager.appendLog("▶  Audio probe (1 s) — speak into the mic now to calibrate…\n")
-        do {
-            try proc.run()
-        } catch {
-            backendManager.appendLog("Probe launch failed: \(error)\n")
-            backendManager.start()
+        case .denied, .restricted:
+            backendManager.appendLog("[Mic] Verweigert — kein System-Dialog mehr.\n")
+            presentMicDeniedNeedsSettingsAlert()
+        @unknown default:
+            break
         }
     }
 
-    // MARK: - Mic-denied alert
+    /// Kurz die Capture-Pipeline öffnen — triggert TCC/Zuordnung zuverlässiger als nur `requestAccess`.
+    private func runMicCaptureWarmupIfAuthorized(reason: String) {
+        guard !didRunMicCaptureWarmup else { return }
+        guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else { return }
+        didRunMicCaptureWarmup = true
+        backendManager.appendLog("[Mic] Warmup (\(reason)): starte AVCaptureSession (~0,6 s) …\n")
 
-    private func showMicDeniedAlert() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let session = AVCaptureSession()
+            session.beginConfiguration()
+            if session.canSetSessionPreset(.medium) {
+                session.sessionPreset = .medium
+            }
+            guard let device = AVCaptureDevice.default(for: .audio) else {
+                DispatchQueue.main.async {
+                    self.backendManager.appendLog("[Mic] Warmup: kein Standard-Audiogerät.\n")
+                }
+                return
+            }
+            do {
+                let input = try AVCaptureDeviceInput(device: device)
+                guard session.canAddInput(input) else {
+                    DispatchQueue.main.async {
+                        self.backendManager.appendLog("[Mic] Warmup: canAddInput == false.\n")
+                    }
+                    return
+                }
+                session.addInput(input)
+            } catch {
+                DispatchQueue.main.async {
+                    self.backendManager.appendLog("[Mic] Warmup: \(error.localizedDescription)\n")
+                }
+                return
+            }
+            session.commitConfiguration()
+            session.startRunning()
+            Thread.sleep(forTimeInterval: 0.65)
+            session.stopRunning()
+            DispatchQueue.main.async {
+                self.backendManager.appendLog("[Mic] Warmup beendet — prüfe Datenschutz → Mikrofon auf „Jarvis“.\n")
+            }
+        }
+    }
+
+    private static func describeCaptureStatus(_ s: AVAuthorizationStatus) -> String {
+        switch s {
+        case .notDetermined: return "notDetermined (System-Dialog möglich)"
+        case .restricted:    return "restricted"
+        case .denied:        return "denied"
+        case .authorized:    return "authorized"
+        @unknown default:    return "unknown"
+        }
+    }
+
+    @available(macOS 14.0, *)
+    private static func describeRecordPermission(_ p: AVAudioApplication.recordPermission) -> String {
+        switch p {
+        case .undetermined: return "undetermined (System-Dialog möglich)"
+        case .denied:       return "denied"
+        case .granted:      return "granted"
+        @unknown default:   return "unknown"
+        }
+    }
+
+    // MARK: - Reset microphone permission
+
+    func resetMicrophonePermission() {
+        let confirm = NSAlert()
+        confirm.alertStyle      = .informational
+        confirm.messageText     = "Reset Microphone Permission?"
+        confirm.informativeText =
+            "This will clear Jarvis's microphone entry from System Settings so macOS " +
+            "asks you again on the next launch.\n\n" +
+            "Jarvis will quit automatically — just relaunch it and click Allow."
+        confirm.addButton(withTitle: "Reset & Quit")
+        confirm.addButton(withTitle: "Cancel")
+        guard confirm.runModal() == .alertFirstButtonReturn else { return }
+
+        let bundleID = Bundle.main.bundleIdentifier ?? ""
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
+        proc.arguments     = ["reset", "Microphone", bundleID]
+        try? proc.run()
+        proc.waitUntilExit()
+
+        NSApp.terminate(nil)
+    }
+
+    /// No system sheet possible anymore after deny — only Settings or `tccutil` reset.
+    private func presentMicDeniedNeedsSettingsAlert() {
         let alert = NSAlert()
         alert.alertStyle      = .warning
-        alert.messageText     = "Microphone Access Needed"
+        alert.messageText     = "Microphone Access Denied"
+        let bid = Bundle.main.bundleIdentifier ?? ""
         alert.informativeText =
-            "Jarvis can't hear you because microphone access was denied.\n\n" +
-            "Open System Settings → Privacy & Security → Microphone and switch on Jarvis.\n\n" +
-            "If only 'JarvisApp' (old build, no icon) appears — disable it, then run:\n" +
-            "  tccutil reset Microphone com.felix.jarvis\n" +
-            "and relaunch Jarvis."
+            "macOS will not show the permission dialog again for Jarvis.\n\n" +
+            "Turn the switch on for Jarvis under Privacy & Security → Microphone, " +
+            "or use Jarvis → Reset Mic Permission…\n\n" +
+            "Terminal:  tccutil reset Microphone \(bid)"
         alert.addButton(withTitle: "Open System Settings")
-        alert.addButton(withTitle: "Ignore")
+        alert.addButton(withTitle: "Continue without Microphone")
         if alert.runModal() == .alertFirstButtonReturn {
             NSWorkspace.shared.open(
                 URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")!)

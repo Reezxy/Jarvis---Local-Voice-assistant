@@ -36,13 +36,16 @@ final class BackendManager: ObservableObject {
     private static func findProjectRoot() -> String {
         // 1. Info.plist embed — $(SRCROOT)/.. expanded by Xcode at build time
         if let raw = Bundle.main.infoDictionary?["JarvisProjectRoot"] as? String,
-           !raw.isEmpty {
+           !raw.isEmpty,
+           !raw.contains("$(") {
+            // Ungültig, wenn Xcode $(SRCROOT) nicht ersetzt hat — sonst wäre der Pfad nutzlos.
             let resolved = URL(fileURLWithPath: raw).standardized.path
             if FileManager.default.fileExists(atPath: resolved + "/.venv311") {
                 return resolved
             }
-            // Even if .venv311 check fails, trust the baked-in path
-            if resolved != "/" { return resolved }
+            if FileManager.default.fileExists(atPath: resolved + "/chatbot_speech_to_speech.py") {
+                return resolved
+            }
         }
 
         // 2. Walk up from app bundle
@@ -78,14 +81,23 @@ final class BackendManager: ObservableObject {
             return
         }
 
+        if Bundle.main.object(forInfoDictionaryKey: "NSMicrophoneUsageDescription") == nil {
+            appendLog("⚠️  NSMicrophoneUsageDescription fehlt — macOS zeigt kein Mikrofon-Dialogfeld.\n")
+        }
+
         let proc = Process()
         proc.executableURL       = URL(fileURLWithPath: pythonPath)
         proc.arguments           = [scriptPath]
         proc.currentDirectoryURL = URL(fileURLWithPath: projectRoot)
 
-        // Inherit a clean environment so the venv Python is used correctly
+        // Inherit environment; venv bin on PATH helps Hilfsskripte/Unterprozesse
         var env = ProcessInfo.processInfo.environment
-        env["PYTHONUNBUFFERED"] = "1"   // ensure stdout is unbuffered
+        env["PYTHONUNBUFFERED"] = "1"
+        let venvBin = "\(projectRoot)/.venv311/bin"
+        let path = env["PATH"] ?? ""
+        if !path.split(separator: ":").contains(Substring(venvBin)) {
+            env["PATH"] = "\(venvBin):\(path)"
+        }
         proc.environment = env
 
         let outPipe = Pipe()
@@ -117,7 +129,9 @@ final class BackendManager: ObservableObject {
         do {
             try proc.run()
             process = proc
-            appendLog("▶  Launching backend…\nProject root: \(projectRoot)\n\n")
+            let pid = proc.processIdentifier
+            appendLog("▶  Launching backend…\nProject root: \(projectRoot)\n")
+            appendLog("   Python PID \(pid) — in Aktivitätsanzeige prüfen, ob der Prozess läuft.\n\n")
             pollForReady()
         } catch {
             appendLog("❌  Launch failed: \(error)\n")
@@ -197,17 +211,22 @@ final class BackendManager: ObservableObject {
                 }
                 try? await Task.sleep(nanoseconds: 500_000_000)  // 0.5 s
             }
+            self.appendLog(
+                "\n❌  Backend wurde nach 10 min nicht bereit (Port 3000). " +
+                "Läuft evtl. schon ein anderer Dienst auf :3000? (`lsof -i :3000`)\n"
+            )
             self.isFailed = true
         }
     }
 
     private func checkPort3000() async -> Bool {
-        guard let url = URL(string: "http://localhost:3000") else { return false }
-        var req = URLRequest(url: url, timeoutInterval: 2)
-        req.httpMethod = "HEAD"
+        guard let url = URL(string: "http://127.0.0.1:3000/api/status") else { return false }
+        var req = URLRequest(url: url, timeoutInterval: 3)
+        req.httpMethod = "GET"
         do {
             let (_, response) = try await URLSession.shared.data(for: req)
-            return (response as? HTTPURLResponse).map { $0.statusCode < 500 } ?? false
+            guard let http = response as? HTTPURLResponse else { return false }
+            return http.statusCode == 200
         } catch {
             return false
         }

@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import WebKit
 
@@ -32,6 +33,12 @@ struct ContentView: View {
             }
         }
         .frame(minWidth: 400, minHeight: 400)
+        .onAppear {
+            // Fallback: startet das Backend auch wenn `applicationDidBecomeActive` zu spät feuert.
+            if let delegate = NSApp.delegate as? AppDelegate {
+                delegate.backendManager.start()
+            }
+        }
     }
 }
 

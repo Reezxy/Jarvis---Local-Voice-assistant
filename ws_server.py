@@ -35,6 +35,8 @@ _loop: asyncio.AbstractEventLoop | None = None
 _current_state: str = "idle"
 _muted: bool = False
 _state_lock = threading.Lock()
+_start_lock = threading.Lock()
+_servers_started = False
 
 logger = logging.getLogger(__name__)
 
@@ -118,69 +120,131 @@ def get_status() -> dict[str, str | bool]:
         return {"state": _current_state, "muted": _muted}
 
 
+def _cors_end_headers(handler: http.server.BaseHTTPRequestHandler) -> None:
+    handler.send_header("Cache-Control", "no-cache")
+    handler.send_header("Access-Control-Allow-Origin", "*")
+    handler.end_headers()
+
+
+def _handle_api_status(handler: http.server.BaseHTTPRequestHandler) -> None:
+    body = json.dumps(get_status()).encode("utf-8")
+    handler.send_response(200)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Content-Length", str(len(body)))
+    _cors_end_headers(handler)
+    handler.wfile.write(body)
+
+
+def _handle_api_mute(handler: http.server.BaseHTTPRequestHandler) -> None:
+    length = int(handler.headers.get("Content-Length", "0"))
+    raw = handler.rfile.read(length) if length > 0 else b"{}"
+    try:
+        data = json.loads(raw.decode("utf-8"))
+        muted = bool(data["muted"])
+    except (json.JSONDecodeError, KeyError, TypeError):
+        handler.send_error(400, "Invalid mute payload")
+        return
+
+    set_muted(muted)
+    body = json.dumps(get_status()).encode("utf-8")
+    handler.send_response(200)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Content-Length", str(len(body)))
+    _cors_end_headers(handler)
+    handler.wfile.write(body)
+
+
+class _APIOnlyHandler(http.server.BaseHTTPRequestHandler):
+    """Minimal HTTP handler if frontend/dist is missing — still binds :3000 for the macOS app."""
+
+    def log_message(self, *_):
+        pass
+
+    def do_GET(self):
+        if self.path.split("?", 1)[0] == "/api/status":
+            _handle_api_status(self)
+            return
+        if self.path.split("?", 1)[0] in ("/", "/index.html"):
+            html = (
+                "<!DOCTYPE html><html><head><meta charset=\"utf-8\"/><title>Jarvis</title></head>"
+                "<body style=\"font-family:system-ui;padding:2rem\">"
+                "<h1>Jarvis</h1>"
+                "<p>Die Web-UI fehlt. Im Projektordner ausführen:</p>"
+                "<pre style=\"background:#eee;padding:1rem\">cd frontend && npm install && npm run build</pre>"
+                "<p>Dann Jarvis neu starten.</p></body></html>"
+            )
+            b = html.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(b)))
+            _cors_end_headers(self)
+            self.wfile.write(b)
+            return
+        self.send_error(404)
+
+    def do_POST(self):
+        if self.path.split("?", 1)[0] == "/api/mute":
+            _handle_api_mute(self)
+            return
+        self.send_error(404)
+
+
 def _serve_http() -> None:
-    """Serve frontend/dist/ as static files on HTTP_PORT (no internet needed)."""
-    if not _DIST_DIR.exists():
-        logger.warning(
-            "[http-server] %s not found – run `npm run build` inside frontend/",
-            _DIST_DIR,
+    """Serve frontend/dist/ on HTTP_PORT; if dist is missing, still listen (API + stub page)."""
+    has_dist = _DIST_DIR.is_dir()
+
+    if not has_dist:
+        msg = (
+            f"[http-server] {_DIST_DIR} fehlt — starte nur API auf Port {HTTP_PORT} "
+            "(cd frontend && npm run build für die volle UI)\n"
         )
+        logger.warning(msg.strip())
+        print(msg, flush=True)
+
+        with http.server.ThreadingHTTPServer(("", HTTP_PORT), _APIOnlyHandler) as httpd:
+            logger.info("[http-server] API-only http://localhost:%d", HTTP_PORT)
+            print(f"[http-server] listening on http://127.0.0.1:{HTTP_PORT} (API-only)\n", flush=True)
+            httpd.serve_forever()
         return
 
     class _QuietHandler(http.server.SimpleHTTPRequestHandler):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, directory=str(_DIST_DIR), **kwargs)
 
-        def log_message(self, *_):  # silence request logs
+        def log_message(self, *_):
             pass
 
         def do_GET(self):
-            if self.path == "/api/status":
-                body = json.dumps(get_status()).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+            if self.path.split("?", 1)[0] == "/api/status":
+                _handle_api_status(self)
                 return
             super().do_GET()
 
         def do_POST(self):
-            if self.path != "/api/mute":
-                self.send_error(404)
+            if self.path.split("?", 1)[0] == "/api/mute":
+                _handle_api_mute(self)
                 return
-
-            length = int(self.headers.get("Content-Length", "0"))
-            raw = self.rfile.read(length) if length > 0 else b"{}"
-            try:
-                data = json.loads(raw.decode("utf-8"))
-                muted = bool(data["muted"])
-            except (json.JSONDecodeError, KeyError, TypeError):
-                self.send_error(400, "Invalid mute payload")
-                return
-
-            set_muted(muted)
-            body = json.dumps(get_status()).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self.send_error(404)
 
         def end_headers(self):
-            # Allow WebSocket connections from the same origin
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Access-Control-Allow-Origin", "*")
             super().end_headers()
 
     with http.server.ThreadingHTTPServer(("", HTTP_PORT), _QuietHandler) as httpd:
         logger.info("[http-server] serving %s on http://localhost:%d", _DIST_DIR, HTTP_PORT)
+        print(f"[http-server] serving { _DIST_DIR } on http://127.0.0.1:{HTTP_PORT}\n", flush=True)
         httpd.serve_forever()
 
 
 def start() -> None:
     """Start both the WebSocket server and the static HTTP server."""
-    global _loop
+    global _loop, _servers_started
+
+    with _start_lock:
+        if _servers_started:
+            return
+        _servers_started = True
 
     def _run_ws() -> None:
         global _loop

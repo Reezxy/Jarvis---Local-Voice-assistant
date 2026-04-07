@@ -301,14 +301,16 @@
 				DEVELOPMENT_TEAM = 9TGSRQR8N4;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_EXPAND_BUILD_SETTINGS = YES;
 				INFOPLIST_FILE = JarvisApp/Info.plist;
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Jarvis needs the microphone to hear your voice commands.";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 13.0;
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.felix.jarvis;
+				PRODUCT_BUNDLE_IDENTIFIER = com.mdanyl.jarvisapp;
 				PRODUCT_NAME = Jarvis;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 5.0;
@@ -329,14 +331,16 @@
 				DEVELOPMENT_TEAM = 9TGSRQR8N4;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_EXPAND_BUILD_SETTINGS = YES;
 				INFOPLIST_FILE = JarvisApp/Info.plist;
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Jarvis needs the microphone to hear your voice commands.";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 13.0;
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.felix.jarvis;
+				PRODUCT_BUNDLE_IDENTIFIER = com.mdanyl.jarvisapp;
 				PRODUCT_NAME = Jarvis;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 5.0;

@@ -25,10 +25,6 @@ from typing import Optional
 import numpy as np
 import sounddevice as sd
 import webrtcvad
-from faster_whisper import WhisperModel
-from huggingface_hub import hf_hub_download, try_to_load_from_cache
-from kokoro_onnx import Kokoro
-from llama_cpp import Llama
 
 import ws_server
 
@@ -152,8 +148,6 @@ class VoiceAssistant:
         with open(CONFIG_PATH, encoding="utf-8") as f:
             self.cfg: dict = json.load(f)
 
-        ws_server.start()
-
         self._load_llm()
         self._load_tts()
         self._load_stt()
@@ -174,6 +168,9 @@ class VoiceAssistant:
     # ── Loading ───────────────────────────────────────────────────────────────
 
     def _load_llm(self) -> None:
+        from huggingface_hub import hf_hub_download, try_to_load_from_cache
+        from llama_cpp import Llama
+
         c = self.cfg["llm"]
         repo_id  = c["repo_id"]
         filename = c["filename"]
@@ -197,6 +194,8 @@ class VoiceAssistant:
         print("[LLM] Ready  (Metal GPU layers active)")
 
     def _load_tts(self) -> None:
+        from kokoro_onnx import Kokoro
+
         c = self.cfg["tts"]
         base = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0"
         model_p  = Path(c.get("model_file",  "kokoro-v1.0.onnx"))
@@ -212,6 +211,8 @@ class VoiceAssistant:
         print("[TTS] Ready")
 
     def _load_stt(self) -> None:
+        from faster_whisper import WhisperModel
+
         c    = self.cfg["stt"]
         size = c.get("model_size", "base")
         print(f"[STT] Loading faster-whisper '{size}' …")
@@ -829,5 +830,7 @@ class VoiceAssistant:
 
 
 if __name__ == "__main__":
+    # HTTP/WebSocket sofort — bevor schwere ML-Imports in VoiceAssistant laufen.
+    ws_server.start()
     assistant = VoiceAssistant()
     assistant.run()
