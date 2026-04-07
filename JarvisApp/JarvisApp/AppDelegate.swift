@@ -8,12 +8,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let backendManager = BackendManager()
     private var logsWindow: NSWindow?
 
-    /// Kept alive for the entire app lifetime.
-    /// macOS attributes microphone TCC access to the responsible process (this app).
-    /// Holding an active AVAudioEngine input session ensures the audio subsystem stays
-    /// open for the whole process group — including the Python subprocess.
-    private var micEngine: AVAudioEngine?
-
     // MARK: - NSApplicationDelegate
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -22,7 +16,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        micEngine?.stop()
         backendManager.stop()
     }
 
@@ -30,21 +23,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         true
     }
 
-    // MARK: - Microphone permission + audio session
+    // MARK: - Microphone permission
 
     private func requestMicrophoneAccess() {
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
 
         case .authorized:
-            startAudioSession()
+            runAudioProbe()
 
         case .notDetermined:
-            // Show the system permission dialog (0.5 s delay so the window is visible first)
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                 AVCaptureDevice.requestAccess(for: .audio) { granted in
                     DispatchQueue.main.async {
                         if granted {
-                            self.startAudioSession()
+                            self.runAudioProbe()
                         } else {
                             self.showMicDeniedAlert()
                             self.backendManager.start()
@@ -54,45 +46,92 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
         case .denied, .restricted:
-            // TCC already has a denied entry — dialog will NOT appear again.
             backendManager.appendLog(
                 "⚠️  Microphone access denied for com.felix.jarvis.\n" +
                 "   → System Settings → Privacy & Security → Microphone → enable Jarvis\n" +
                 "   → Or reset via Terminal: tccutil reset Microphone com.felix.jarvis\n\n"
             )
             showMicDeniedAlert()
-            backendManager.start()   // start anyway so the UI appears
+            backendManager.start()
 
         @unknown default:
             backendManager.start()
         }
     }
 
-    /// Starts an AVAudioEngine input tap that runs for the app's lifetime.
-    ///
-    /// Why: PortAudio (used by Python's sounddevice) needs the parent process to hold
-    /// an active CoreAudio input session so that the subprocess is covered by the same
-    /// TCC grant. Without this the subprocess gets silence even when "Mic: On" in
-    /// System Settings.
-    private func startAudioSession() {
-        let engine = AVAudioEngine()
-        let inputNode = engine.inputNode
-        let format = inputNode.outputFormat(forBus: 0)
+    // MARK: - Audio probe
+    //
+    // Runs a tiny Python snippet that opens the microphone for 0.15 s and
+    // immediately closes it.  Two purposes:
+    //
+    //  1. If macOS hasn't yet granted TCC access to the Python binary itself
+    //     (separate from the Swift app), it will show the system prompt here —
+    //     BEFORE the main script starts.
+    //
+    //  2. It verifies that sounddevice can actually open the device and records
+    //     the result in the logs.
+    //
+    // Note: we do NOT keep AVAudioEngine running in Swift.  That would hold the
+    // audio device at 44100 Hz and prevent Python/PortAudio from opening it at
+    // 16000 Hz — causing silent captures.
 
-        // Silent tap — we discard all buffers; we only need the session to stay open.
-        inputNode.installTap(onBus: 0, bufferSize: 4096, format: format) { _, _ in }
+    private func runAudioProbe() {
+        let root      = backendManager.projectRoot
+        let python    = root + "/.venv311/bin/python"
 
-        do {
-            try engine.start()
-            micEngine = engine    // strong reference keeps it alive
-            backendManager.appendLog("🎙  Audio session active (\(Int(format.sampleRate)) Hz)\n\n")
-        } catch {
-            backendManager.appendLog("⚠️  Audio session failed: \(error.localizedDescription)\n" +
-                                     "    Python may not be able to access the microphone.\n\n")
+        guard FileManager.default.fileExists(atPath: python) else {
+            backendManager.appendLog("⚠️  Python not found — skipping audio probe\n\n")
+            backendManager.start()
+            return
         }
 
-        // Start backend regardless of whether the engine started
-        backendManager.start()
+        let probe = """
+import sys
+try:
+    import sounddevice as sd, time
+    dev = sd.query_devices(kind='input')
+    print(f"[probe] input device: {dev['name']}  rate: {int(dev['default_samplerate'])} Hz", flush=True)
+    with sd.RawInputStream(samplerate=16000, blocksize=480, dtype='int16', channels=1):
+        time.sleep(0.15)
+    print("[probe] audio OK", flush=True)
+except Exception as e:
+    print(f"[probe] ERROR: {e}", file=sys.stderr, flush=True)
+"""
+
+        let proc = Process()
+        proc.executableURL       = URL(fileURLWithPath: python)
+        proc.arguments           = ["-c", probe]
+        proc.currentDirectoryURL = URL(fileURLWithPath: root)
+
+        var env = ProcessInfo.processInfo.environment
+        env["PYTHONUNBUFFERED"] = "1"
+        proc.environment = env
+
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError  = pipe
+
+        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty, let str = String(data: data, encoding: .utf8) else { return }
+            Task { @MainActor [weak self] in self?.backendManager.appendLog(str) }
+        }
+
+        proc.terminationHandler = { [weak self] _ in
+            pipe.fileHandleForReading.readabilityHandler = nil
+            Task { @MainActor [weak self] in
+                self?.backendManager.appendLog("\n")
+                self?.backendManager.start()
+            }
+        }
+
+        backendManager.appendLog("▶  Running audio probe…\n")
+        do {
+            try proc.run()
+        } catch {
+            backendManager.appendLog("Audio probe launch failed: \(error)\n")
+            backendManager.start()
+        }
     }
 
     // MARK: - Mic-denied alert
