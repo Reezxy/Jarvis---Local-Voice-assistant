@@ -65,7 +65,7 @@ async def _broadcast(state: str, muted: bool) -> None:
 
 
 async def _serve() -> None:
-    async with websockets.serve(_handler, "localhost", PORT):
+    async with websockets.serve(_handler, "127.0.0.1", PORT):
         await asyncio.Future()  # run forever
 
 

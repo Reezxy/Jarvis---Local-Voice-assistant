@@ -181,8 +181,15 @@ class VoiceAssistant:
             model_path = cached
             print("[LLM] Found in local cache — skipping network.")
         else:
-            print("[LLM] Not cached — downloading from HuggingFace …")
-            model_path = hf_hub_download(repo_id=repo_id, filename=filename)
+            # try_to_load_from_cache missed it — try local_files_only before going to the network
+            try:
+                model_path = hf_hub_download(
+                    repo_id=repo_id, filename=filename, local_files_only=True
+                )
+                print("[LLM] Found in HF cache (local_files_only) — skipping network.")
+            except Exception:
+                print("[LLM] Not cached — downloading from HuggingFace …")
+                model_path = hf_hub_download(repo_id=repo_id, filename=filename)
 
         self._llm = Llama(
             model_path=str(model_path),
@@ -217,13 +224,15 @@ class VoiceAssistant:
         size = c.get("model_size", "base")
         print(f"[STT] Loading faster-whisper '{size}' …")
         try:
-            offline = os.environ.get("HF_HUB_OFFLINE", "0") == "1"
-            self._stt = WhisperModel(
-                size, device="cpu", compute_type="int8", local_files_only=offline
-            )
-        except Exception:
+            # Always try local cache first — avoids HuggingFace network call when offline.
             self._stt = WhisperModel(
                 size, device="cpu", compute_type="int8", local_files_only=True
+            )
+        except Exception:
+            # Model not in local cache yet — download it (requires internet).
+            print(f"[STT] Model not cached — downloading faster-whisper '{size}' …")
+            self._stt = WhisperModel(
+                size, device="cpu", compute_type="int8", local_files_only=False
             )
         self._lang: str = c.get("language", "en")
         print("[STT] Ready")
