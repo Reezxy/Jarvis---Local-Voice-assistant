@@ -64,21 +64,49 @@ final class BackendManager: ObservableObject {
     var venvPip:    URL { venvDir.appendingPathComponent("bin/pip") }
     /// Sentinel stores the venv path so we don't search again on next launch.
     var setupSentinel: URL { appSupportDir.appendingPathComponent(".setup_complete") }
-    var hfCacheDir:    URL { appSupportDir.appendingPathComponent("hf_cache") }
 
-    /// Script bundled inside .app/Contents/Resources/
-    var bundledScriptPath: String {
-        Bundle.main.path(forResource: "chatbot_speech_to_speech", ofType: "py") ?? ""
+    // MARK: - Script resolution
+
+    /// The Python script to run. Checked in priority order:
+    ///   1. Bundled in .app/Resources  (production DMG)
+    ///   2. Copied to appSupportDir    (placed there by runSetup)
+    ///   3. Next to the resolved venv  (dev / local project)
+    var effectiveScriptPath: String {
+        let fm = FileManager.default
+        // 1. Bundle
+        if let p = Bundle.main.path(forResource: "chatbot_speech_to_speech", ofType: "py"),
+           fm.fileExists(atPath: p) { return p }
+        // 2. App Support (copied during setup so the path is always predictable)
+        let inSupport = appSupportDir.appendingPathComponent("chatbot_speech_to_speech.py").path
+        if fm.fileExists(atPath: inSupport) { return inSupport }
+        // 3. Sibling of the venv (works when running from the project folder)
+        if let venv = resolvedVenvDir {
+            let p = venv.deletingLastPathComponent()
+                        .appendingPathComponent("chatbot_speech_to_speech.py").path
+            if fm.fileExists(atPath: p) { return p }
+        }
+        return ""
     }
-    /// Directory of bundled scripts (used as Python working dir so `import ws_server` works)
-    var bundledResourcesDir: String {
-        guard let p = Bundle.main.path(forResource: "chatbot_speech_to_speech", ofType: "py") else { return "" }
-        return (p as NSString).deletingLastPathComponent
+
+    /// Working directory for the Python process (must also contain ws_server.py).
+    var effectiveScriptsDir: String {
+        let script = effectiveScriptPath
+        guard !script.isEmpty else { return appSupportDir.path }
+        return (script as NSString).deletingLastPathComponent
     }
+
     var requirementsPath: String {
-        Bundle.main.path(forResource: "requirements_speech_to_speech", ofType: "txt") ?? ""
+        // Bundled first, else next to the venv
+        if let p = Bundle.main.path(forResource: "requirements_speech_to_speech", ofType: "txt") { return p }
+        if let venv = resolvedVenvDir {
+            let p = venv.deletingLastPathComponent()
+                        .appendingPathComponent("requirements_speech_to_speech.txt").path
+            if FileManager.default.fileExists(atPath: p) { return p }
+        }
+        return ""
     }
-    /// Pre-built frontend dist bundled in .app/Contents/Resources/
+
+    /// Pre-built frontend dist bundled in .app/Contents/Resources/dist
     var bundledDistDir: URL? {
         Bundle.main.url(forResource: "dist", withExtension: nil)
     }
@@ -136,7 +164,7 @@ final class BackendManager: ObservableObject {
     /// Returns the first venv that has Python + all required packages installed.
     private func findInstalledVenv() -> URL? {
         let fm = FileManager.default
-        let required = ["llama_cpp", "faster_whisper", "kokoro_onnx", "sounddevice", "webrtcvad"]
+        let required = ["llama_cpp", "faster_whisper", "kokoro_onnx", "sounddevice", "webrtcvad", "websockets"]
 
         for candidate in venvCandidates() {
             let python = candidate.appendingPathComponent("bin/python").path
@@ -203,7 +231,10 @@ final class BackendManager: ObservableObject {
             appendSetup("✅  Python environment already exists.\n\n")
         }
 
-        // 3. Upgrade pip
+        // 3. Copy bundled scripts to appSupportDir so they're always accessible
+        copyBundledScripts()
+
+        // 4. Upgrade pip
         appendSetup("⬆️   Upgrading pip...\n")
         _ = await runCmd(venvPip.path, ["install", "--upgrade", "pip", "-q"])
         appendSetup("✅  Done.\n\n")
@@ -230,6 +261,23 @@ final class BackendManager: ObservableObject {
         startBackend()
     }
 
+    /// Copy Python scripts from the app bundle to appSupportDir so the backend can always find them.
+    private func copyBundledScripts() {
+        let fm = FileManager.default
+        let resources: [(String, String)] = [
+            ("chatbot_speech_to_speech", "py"),
+            ("ws_server",                "py"),
+            ("config",                   "json"),
+        ]
+        for (name, ext) in resources {
+            guard let src = Bundle.main.path(forResource: name, ofType: ext) else { continue }
+            let dst = appSupportDir.appendingPathComponent("\(name).\(ext)").path
+            // Always overwrite so updates from the bundle propagate
+            try? fm.removeItem(atPath: dst)
+            try? fm.copyItem(atPath: src, toPath: dst)
+        }
+    }
+
     private func findSystemPython() -> String? {
         let candidates = [
             "/opt/homebrew/bin/python3.11",
@@ -252,30 +300,32 @@ final class BackendManager: ObservableObject {
         phase = .starting
 
         let pythonPath = venvPython.path
-        let scriptPath = bundledScriptPath
+        let scriptPath = effectiveScriptPath
 
         guard FileManager.default.fileExists(atPath: pythonPath) else {
             phase = .failed("Python not found at \(pythonPath)")
             return
         }
-        guard !scriptPath.isEmpty, FileManager.default.fileExists(atPath: scriptPath) else {
-            phase = .failed("chatbot_speech_to_speech.py missing from app bundle")
+        guard !scriptPath.isEmpty else {
+            phase = .failed("chatbot_speech_to_speech.py not found.\nRebuild in Xcode or place the script next to the venv.")
             return
         }
 
         let proc = Process()
         proc.executableURL       = URL(fileURLWithPath: pythonPath)
         proc.arguments           = [scriptPath]
-        // Run from the bundled scripts dir so `import ws_server` works
-        proc.currentDirectoryURL = URL(fileURLWithPath: bundledResourcesDir.isEmpty
-                                       ? appSupportDir.path : bundledResourcesDir)
+        proc.currentDirectoryURL = URL(fileURLWithPath: effectiveScriptsDir)
 
         var env = ProcessInfo.processInfo.environment
-        env["PYTHONUNBUFFERED"]  = "1"
-        env["JARVIS_DATA_DIR"]   = appSupportDir.path       // models, config override
-        env["HF_HOME"]           = hfCacheDir.path           // Whisper + LLM cache
+        env["PYTHONUNBUFFERED"] = "1"
+        env["JARVIS_DATA_DIR"]  = appSupportDir.path   // models + config override dir
+        // Do NOT override HF_HOME — let HuggingFace use its default ~/.cache/huggingface/
+        // so already-downloaded LLM / Whisper models are found immediately.
+        // Pass the directory that contains the .app so Python can find Kokoro models next to it.
+        env["JARVIS_BUNDLE_DIR"] = URL(fileURLWithPath: Bundle.main.bundlePath)
+                                       .deletingLastPathComponent().path
         if let dist = bundledDistDir {
-            env["JARVIS_DIST_DIR"] = dist.path              // pre-built UI
+            env["JARVIS_DIST_DIR"] = dist.path         // pre-built UI in bundle
         }
         // Prepend venv/bin to PATH so subprocesses find the right Python
         let venvBin = venvDir.appendingPathComponent("bin").path

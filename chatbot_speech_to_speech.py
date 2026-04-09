@@ -215,12 +215,22 @@ class VoiceAssistant:
         c = self.cfg["tts"]
         base = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0"
 
+        # Build ordered list of directories to search for model files.
+        _search_dirs = [
+            _DATA_DIR,                          # ~/Library/Application Support/Jarvis/
+            Path(__file__).parent,              # bundle Resources or project root (local dev)
+        ]
+        _bundle_dir = os.environ.get("JARVIS_BUNDLE_DIR")
+        if _bundle_dir:
+            _search_dirs.append(Path(_bundle_dir))  # folder containing the .app
+
         def _resolve(key: str, default: str) -> Path:
-            """Look in data dir first, then script dir, then use data dir as download target."""
+            """Search known dirs for the model file; fall back to _DATA_DIR as download target."""
             name = Path(c.get(key, default)).name
-            for candidate in (_DATA_DIR / name, Path(__file__).parent / name):
-                if candidate.is_file():
-                    return candidate
+            for d in _search_dirs:
+                p = d / name
+                if p.is_file():
+                    return p
             return _DATA_DIR / name   # download destination
 
         model_p  = _resolve("model_file",  "kokoro-v1.0.onnx")
