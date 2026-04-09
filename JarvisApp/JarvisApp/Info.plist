@@ -26,11 +26,6 @@
 	<string>NSApplication</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>Local Jarvis Voice Assistant</string>
-	<!-- Absolute path to project root, baked in at build time by Xcode variable expansion.
-	     $(SRCROOT) = …/JarvisApp  →  $(SRCROOT)/.. = the repo root that contains .venv311 -->
-	<key>JarvisProjectRoot</key>
-	<string>$(SRCROOT)/..</string>
-
 	<!-- Required so macOS shows the microphone permission prompt for this app.
 	     The Python subprocess records audio, but TCC ties permission to the parent app. -->
 	<key>NSMicrophoneUsageDescription</key>

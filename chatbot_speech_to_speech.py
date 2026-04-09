@@ -28,8 +28,17 @@ import webrtcvad
 
 import ws_server
 
+# ── Data directory ────────────────────────────────────────────────────────────
+# When running inside the macOS app, the Swift wrapper sets JARVIS_DATA_DIR to
+# ~/Library/Application Support/Jarvis/ so models and config survive app updates.
+# When running locally (start.command / CLI), falls back to the script directory.
+_DATA_DIR = Path(os.environ["JARVIS_DATA_DIR"]) if "JARVIS_DATA_DIR" in os.environ else Path(__file__).parent
+
 # ── Constants ─────────────────────────────────────────────────────────────────
-CONFIG_PATH = Path(__file__).parent / "config.json"
+# config.json: user's copy in data dir first, bundled default as fallback
+CONFIG_PATH = _DATA_DIR / "config.json"
+if not CONFIG_PATH.is_file():
+    CONFIG_PATH = Path(__file__).parent / "config.json"
 SAMPLE_RATE  = 16_000
 TTS_RATE     = 24_000
 FRAME_MS     = 30
@@ -205,8 +214,17 @@ class VoiceAssistant:
 
         c = self.cfg["tts"]
         base = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0"
-        model_p  = Path(c.get("model_file",  "kokoro-v1.0.onnx"))
-        voices_p = Path(c.get("voices_file", "voices-v1.0.bin"))
+
+        def _resolve(key: str, default: str) -> Path:
+            """Look in data dir first, then script dir, then use data dir as download target."""
+            name = Path(c.get(key, default)).name
+            for candidate in (_DATA_DIR / name, Path(__file__).parent / name):
+                if candidate.is_file():
+                    return candidate
+            return _DATA_DIR / name   # download destination
+
+        model_p  = _resolve("model_file",  "kokoro-v1.0.onnx")
+        voices_p = _resolve("voices_file", "voices-v1.0.bin")
         if not model_p.is_file():
             _download(f"{base}/{model_p.name}", model_p)
         if not voices_p.is_file():

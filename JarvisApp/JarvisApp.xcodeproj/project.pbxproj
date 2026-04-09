@@ -13,6 +13,11 @@
 		AABBCCDD0000000000000017 /* BackendManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = AABBCCDD0000000000000016 /* BackendManager.swift */; };
 		AABBCCDD0000000000000019 /* LogsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AABBCCDD0000000000000018 /* LogsView.swift */; };
 		AABBCCDD000000000000001F /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = AABBCCDD000000000000001E /* Assets.xcassets */; };
+		AABBCCDD0000000000000041 /* chatbot_speech_to_speech.py in Resources */ = {isa = PBXBuildFile; fileRef = AABBCCDD0000000000000040 /* chatbot_speech_to_speech.py */; };
+		AABBCCDD0000000000000043 /* ws_server.py in Resources */ = {isa = PBXBuildFile; fileRef = AABBCCDD0000000000000042 /* ws_server.py */; };
+		AABBCCDD0000000000000045 /* config.json in Resources */ = {isa = PBXBuildFile; fileRef = AABBCCDD0000000000000044 /* config.json */; };
+		AABBCCDD0000000000000047 /* requirements_speech_to_speech.txt in Resources */ = {isa = PBXBuildFile; fileRef = AABBCCDD0000000000000046 /* requirements_speech_to_speech.txt */; };
+		AABBCCDD0000000000000049 /* dist in Resources */ = {isa = PBXBuildFile; fileRef = AABBCCDD0000000000000048 /* dist */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -25,6 +30,11 @@
 		AABBCCDD000000000000001B /* JarvisApp.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = JarvisApp.entitlements; sourceTree = "<group>"; };
 		AABBCCDD000000000000001E /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		AABBCCDD000000000000001C /* Jarvis.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Jarvis.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		AABBCCDD0000000000000040 /* chatbot_speech_to_speech.py */ = {isa = PBXFileReference; lastKnownFileType = text.script.python; name = chatbot_speech_to_speech.py; path = ../../chatbot_speech_to_speech.py; sourceTree = "<group>"; };
+		AABBCCDD0000000000000042 /* ws_server.py */ = {isa = PBXFileReference; lastKnownFileType = text.script.python; name = ws_server.py; path = ../../ws_server.py; sourceTree = "<group>"; };
+		AABBCCDD0000000000000044 /* config.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; name = config.json; path = ../../config.json; sourceTree = "<group>"; };
+		AABBCCDD0000000000000046 /* requirements_speech_to_speech.txt */ = {isa = PBXFileReference; lastKnownFileType = text; name = requirements_speech_to_speech.txt; path = ../../requirements_speech_to_speech.txt; sourceTree = "<group>"; };
+		AABBCCDD0000000000000048 /* dist */ = {isa = PBXFileReference; lastKnownFileType = folder; name = dist; path = ../../frontend/dist; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -57,6 +67,11 @@
 				AABBCCDD000000000000001A /* Info.plist */,
 				AABBCCDD000000000000001B /* JarvisApp.entitlements */,
 				AABBCCDD000000000000001E /* Assets.xcassets */,
+				AABBCCDD0000000000000040 /* chatbot_speech_to_speech.py */,
+				AABBCCDD0000000000000042 /* ws_server.py */,
+				AABBCCDD0000000000000044 /* config.json */,
+				AABBCCDD0000000000000046 /* requirements_speech_to_speech.txt */,
+				AABBCCDD0000000000000048 /* dist */,
 			);
 			path = JarvisApp;
 			sourceTree = "<group>";
@@ -129,13 +144,18 @@
 			buildActionMask = 2147483647;
 			files = (
 				AABBCCDD000000000000001F /* Assets.xcassets in Resources */,
+				AABBCCDD0000000000000041 /* chatbot_speech_to_speech.py in Resources */,
+				AABBCCDD0000000000000043 /* ws_server.py in Resources */,
+				AABBCCDD0000000000000045 /* config.json in Resources */,
+				AABBCCDD0000000000000047 /* requirements_speech_to_speech.txt in Resources */,
+				AABBCCDD0000000000000049 /* dist in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXShellScriptBuildPhase section */
-		AABBCCDD000000000000001D /* Check venv (Run Script) */ = {
+		AABBCCDD000000000000001D /* Check frontend dist (Run Script) */ = {
 			isa = PBXShellScriptBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -144,14 +164,14 @@
 			);
 			inputPaths = (
 			);
-			name = "Check venv (Run Script)";
+			name = "Check frontend dist (Run Script)";
 			outputFileListPaths = (
 			);
 			outputPaths = (
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "VENV=\"$SRCROOT/../.venv311/bin/python\"\nif [ ! -f \"$VENV\" ]; then\n    echo \"warning: .venv311 not found at $SRCROOT/.. — run project setup before building\"\nfi\n";
+			shellScript = "DIST=\"$SRCROOT/../../frontend/dist\"\nif [ ! -d \"$DIST\" ]; then\n    echo \"warning: frontend/dist not found — run: cd frontend && npm run build\"\nfi\n";
 			showEnvVarsInLog = 0;
 		};
 /* End PBXShellScriptBuildPhase section */

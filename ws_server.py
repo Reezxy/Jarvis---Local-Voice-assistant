@@ -18,6 +18,7 @@ import functools
 import http.server
 import json
 import logging
+import os
 import threading
 from pathlib import Path
 from typing import Set
@@ -28,7 +29,15 @@ from websockets.server import WebSocketServerProtocol
 PORT      = 8765
 HTTP_PORT = 3000
 
-_DIST_DIR = Path(__file__).parent / "frontend" / "dist"
+# When running inside the macOS app, JARVIS_DIST_DIR points to the pre-built
+# frontend bundled in Contents/Resources/dist/.
+# When running locally (start.command), fall back to frontend/dist/ next to this file.
+_dist_env = os.environ.get("JARVIS_DIST_DIR")
+_DIST_DIR = (
+    Path(_dist_env)
+    if _dist_env and Path(_dist_env).is_dir()
+    else Path(__file__).parent / "frontend" / "dist"
+)
 
 _clients: Set[WebSocketServerProtocol] = set()
 _loop: asyncio.AbstractEventLoop | None = None
