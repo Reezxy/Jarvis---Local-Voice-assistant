@@ -55,9 +55,14 @@ final class BackendManager: ObservableObject {
     // MARK: - Paths
 
     let appSupportDir = kAppSupportDir
-    var venvDir:       URL { appSupportDir.appendingPathComponent(".venv") }
-    var venvPython:    URL { venvDir.appendingPathComponent("bin/python") }
-    var venvPip:       URL { venvDir.appendingPathComponent("bin/pip") }
+    /// Default venv location for fresh installs.
+    var defaultVenvDir: URL { appSupportDir.appendingPathComponent(".venv") }
+    /// Resolved venv — set during start(); may point to an existing venv found on the system.
+    private var resolvedVenvDir: URL?
+    var venvDir:    URL { resolvedVenvDir ?? defaultVenvDir }
+    var venvPython: URL { venvDir.appendingPathComponent("bin/python") }
+    var venvPip:    URL { venvDir.appendingPathComponent("bin/pip") }
+    /// Sentinel stores the venv path so we don't search again on next launch.
     var setupSentinel: URL { appSupportDir.appendingPathComponent(".setup_complete") }
     var hfCacheDir:    URL { appSupportDir.appendingPathComponent("hf_cache") }
 
@@ -88,14 +93,71 @@ final class BackendManager: ObservableObject {
         }
         phase = .idle
 
-        let sentinelExists = FileManager.default.fileExists(atPath: setupSentinel.path)
-        let venvExists     = FileManager.default.fileExists(atPath: venvPython.path)
-
-        if sentinelExists && venvExists {
-            startBackend()
-        } else {
-            Task { await self.runSetup() }
+        // Sentinel stores the venv path we confirmed last time.
+        if let savedPath = readSentinel() {
+            let python = URL(fileURLWithPath: savedPath).appendingPathComponent("bin/python").path
+            if FileManager.default.fileExists(atPath: python) {
+                resolvedVenvDir = URL(fileURLWithPath: savedPath)
+                startBackend()
+                return
+            }
+            // Sentinel stale (venv was deleted) — fall through to setup
+            try? FileManager.default.removeItem(at: setupSentinel)
         }
+
+        Task { await self.runSetup() }
+    }
+
+    private func writeSentinel(_ venvURL: URL) {
+        try? venvURL.path.write(toFile: setupSentinel.path, atomically: true, encoding: .utf8)
+    }
+
+    /// Returns the venv path stored in the sentinel file, or nil if absent/corrupt.
+    private func readSentinel() -> String? {
+        guard let raw = try? String(contentsOf: setupSentinel, encoding: .utf8) else { return nil }
+        let path = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return path.isEmpty ? nil : path
+    }
+
+    /// Candidate venv locations to check before doing a full install.
+    private func venvCandidates() -> [URL] {
+        var result: [URL] = [defaultVenvDir]
+        // Walk up from the .app bundle looking for .venv311, .venv, venv
+        var dir = URL(fileURLWithPath: Bundle.main.bundlePath)
+        for _ in 0..<12 {
+            dir = dir.deletingLastPathComponent()
+            for name in [".venv311", ".venv", "venv"] {
+                result.append(dir.appendingPathComponent(name))
+            }
+        }
+        return result
+    }
+
+    /// Returns the first venv that has Python + all required packages installed.
+    private func findInstalledVenv() -> URL? {
+        let fm = FileManager.default
+        let required = ["llama_cpp", "faster_whisper", "kokoro_onnx", "sounddevice", "webrtcvad"]
+
+        for candidate in venvCandidates() {
+            let python = candidate.appendingPathComponent("bin/python").path
+            guard fm.fileExists(atPath: python) else { continue }
+
+            // Find lib/python3.x/site-packages
+            let libDir = candidate.appendingPathComponent("lib")
+            guard let libContents = try? fm.contentsOfDirectory(atPath: libDir.path),
+                  let pyDir = libContents.first(where: { $0.hasPrefix("python3") }) else { continue }
+            let sp = libDir.appendingPathComponent(pyDir).appendingPathComponent("site-packages")
+            guard let pkgs = try? fm.contentsOfDirectory(atPath: sp.path) else { continue }
+
+            let hasAll = required.allSatisfy { req in
+                pkgs.contains { entry in
+                    let e = entry.lowercased()
+                    return e.hasPrefix(req) || e.hasPrefix(req.replacingOccurrences(of: "_", with: "-"))
+                }
+            }
+            if hasAll { return candidate }
+        }
+        return nil
     }
 
     // MARK: - First-time setup
@@ -103,6 +165,18 @@ final class BackendManager: ObservableObject {
     private func runSetup() async {
         phase    = .setup
         setupLog = ""
+
+        // 0. Check if a working venv with all packages already exists somewhere on this Mac.
+        appendSetup("🔍  Checking for existing Jarvis installation...\n")
+        if let existing = findInstalledVenv() {
+            appendSetup("✅  Found existing installation at:\n    \(existing.path)\n\n")
+            appendSetup("🚀  Starting Jarvis...\n")
+            resolvedVenvDir = existing
+            writeSentinel(existing)
+            startBackend()
+            return
+        }
+        appendSetup("   None found — performing first-time setup.\n\n")
 
         // 1. Find Python
         appendSetup("🔍  Searching for Python 3...\n")
@@ -150,8 +224,8 @@ final class BackendManager: ObservableObject {
         }
         appendSetup("\n✅  All packages installed.\n\n")
 
-        // 5. Write sentinel
-        try? "done".write(toFile: setupSentinel.path, atomically: true, encoding: .utf8)
+        // 5. Write sentinel (stores venv path for fast detection on next launch)
+        writeSentinel(venvDir)
         appendSetup("🚀  Starting Jarvis...\n")
         startBackend()
     }
@@ -324,11 +398,15 @@ final class BackendManager: ObservableObject {
         }
     }
 
-    /// Wipe the venv + sentinel → triggers full re-setup on next start.
+    /// Wipe the sentinel (and the default venv if it was created by us) → triggers re-setup.
     func resetSetup() {
         stop()
+        // Only delete the venv if it's our own (in appSupportDir) — don't touch user's .venv311
+        if resolvedVenvDir == defaultVenvDir || resolvedVenvDir == nil {
+            try? FileManager.default.removeItem(at: defaultVenvDir)
+        }
         try? FileManager.default.removeItem(at: setupSentinel)
-        try? FileManager.default.removeItem(at: venvDir)
+        resolvedVenvDir = nil
         setupLog = ""
         logs     = ""
         phase    = .idle
