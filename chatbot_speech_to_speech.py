@@ -180,9 +180,10 @@ class VoiceAssistant:
         self._stop_speak = threading.Event()
 
         # Persistent neural memory
+        from neural_memory import MemoryConfig
         self._mem = MemorySystem(
             provider=LocalProvider(),
-            storage_dir=MEMORY_DIR,
+            config=MemoryConfig(persist_directory=MEMORY_DIR),
         )
 
         # Proactive background monitor

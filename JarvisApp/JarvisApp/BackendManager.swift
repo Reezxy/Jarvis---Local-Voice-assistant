@@ -164,7 +164,7 @@ final class BackendManager: ObservableObject {
     /// Returns the first venv that has Python + all required packages installed.
     private func findInstalledVenv() -> URL? {
         let fm = FileManager.default
-        let required = ["llama_cpp", "faster_whisper", "kokoro_onnx", "sounddevice", "webrtcvad", "websockets"]
+        let required = ["llama_cpp", "faster_whisper", "kokoro_onnx", "sounddevice", "webrtcvad", "websockets", "neural_memory"]
 
         for candidate in venvCandidates() {
             let python = candidate.appendingPathComponent("bin/python").path

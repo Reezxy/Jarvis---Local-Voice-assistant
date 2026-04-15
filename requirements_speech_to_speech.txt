@@ -7,3 +7,4 @@ websockets
 numpy
 huggingface_hub
 setuptools
+neural-ai-memory[local]
