@@ -25,6 +25,8 @@ from typing import Optional
 import numpy as np
 import sounddevice as sd
 import webrtcvad
+from neural_memory import MemorySystem
+from neural_memory.providers import LocalProvider
 
 import ws_server
 
@@ -36,9 +38,12 @@ _DATA_DIR = Path(os.environ["JARVIS_DATA_DIR"]) if "JARVIS_DATA_DIR" in os.envir
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 # config.json: user's copy in data dir first, bundled default as fallback
-CONFIG_PATH = _DATA_DIR / "config.json"
+CONFIG_PATH  = _DATA_DIR / "config.json"
 if not CONFIG_PATH.is_file():
     CONFIG_PATH = Path(__file__).parent / "config.json"
+MEMORY_DIR   = str(_DATA_DIR / "jarvis_memory_db")
+
+WAKE_TIMEOUT = 120   # seconds of silence → enter wake-word mode
 SAMPLE_RATE  = 16_000
 TTS_RATE     = 24_000
 FRAME_MS     = 30
@@ -173,6 +178,15 @@ class VoiceAssistant:
             "Keep answers brief and conversational. No bullet points or markdown.",
         )
         self._stop_speak = threading.Event()
+
+        # Persistent neural memory
+        self._mem = MemorySystem(
+            provider=LocalProvider(),
+            storage_dir=MEMORY_DIR,
+        )
+
+        # Proactive background monitor
+        threading.Thread(target=self._proactive_loop, daemon=True).start()
 
     # ── Loading ───────────────────────────────────────────────────────────────
 
@@ -462,6 +476,231 @@ class VoiceAssistant:
         )
         return result.stdout.strip()
 
+    # ── Persistent memory ─────────────────────────────────────────────────────
+
+    def _memory_set(self, key: str, value: str) -> None:
+        self._mem.store(f"{key}: {value}", importance=0.7, tags=[key.lower().strip()])
+
+    def _memory_recall(self, query: str = "") -> str:
+        try:
+            q = query or "recent memories"
+            results = self._mem.recall(q, top_k=5)
+            if not results:
+                return "I don't have anything stored in memory yet, Sir."
+            parts = [r.memory.content for r in results]
+            return "I remember — " + "; ".join(parts) + "."
+        except Exception:
+            return "I couldn't access my memory right now, Sir."
+
+    def _memory_forget(self, query: str) -> str:
+        try:
+            results = self._mem.recall(query, top_k=3)
+            if not results:
+                return f"I didn't find anything about {query} to forget, Sir."
+            for r in results:
+                self._mem.forget(r.memory.id)
+            return f"Done, I've forgotten about {query}, Sir."
+        except Exception:
+            return "I couldn't update my memory right now, Sir."
+
+    # ── Weather ───────────────────────────────────────────────────────────────
+
+    _WMO: dict[int, str] = {
+        0: "clear skies", 1: "mainly clear", 2: "partly cloudy", 3: "overcast",
+        45: "foggy", 48: "icy fog",
+        51: "light drizzle", 53: "drizzle", 55: "heavy drizzle",
+        61: "light rain", 63: "rain", 65: "heavy rain",
+        71: "light snow", 73: "snow", 75: "heavy snow",
+        80: "rain showers", 81: "rain showers", 82: "violent rain showers",
+        95: "thunderstorms", 96: "thunderstorms with hail", 99: "heavy thunderstorms",
+    }
+
+    def _get_weather(self, location: str = "") -> str:
+        try:
+            if not location:
+                with urllib.request.urlopen("http://ip-api.com/json/", timeout=4) as r:
+                    geo = json.loads(r.read())
+                lat, lon, city = geo["lat"], geo["lon"], geo.get("city", "your area")
+            else:
+                geo_url = (
+                    "https://geocoding-api.open-meteo.com/v1/search?name="
+                    + urllib.parse.quote(location) + "&count=1&format=json"
+                )
+                with urllib.request.urlopen(geo_url, timeout=4) as r:
+                    geo_data = json.loads(r.read())
+                res  = geo_data["results"][0]
+                lat, lon, city = res["latitude"], res["longitude"], res.get("name", location)
+
+            w_url = (
+                f"https://api.open-meteo.com/v1/forecast"
+                f"?latitude={lat}&longitude={lon}"
+                f"&current=temperature_2m,apparent_temperature,weathercode,windspeed_10m"
+                f"&temperature_unit=celsius&windspeed_unit=kmh&timezone=auto"
+            )
+            with urllib.request.urlopen(w_url, timeout=5) as r:
+                w = json.loads(r.read())
+
+            curr  = w["current"]
+            temp  = round(curr["temperature_2m"])
+            feels = round(curr["apparent_temperature"])
+            wind  = round(curr["windspeed_10m"])
+            desc  = self._WMO.get(int(curr["weathercode"]), "mixed conditions")
+            return (
+                f"Currently {desc} in {city}, {temp} degrees Celsius, "
+                f"feels like {feels}, wind at {wind} kilometres per hour, Sir."
+            )
+        except Exception:
+            return "I couldn't retrieve the weather right now, Sir."
+
+    # ── Window management ─────────────────────────────────────────────────────
+
+    def _window_maximize(self) -> str:
+        # Click the zoom button of the frontmost window
+        self._applescript(
+            'tell application "System Events" to tell process '
+            '(name of first application process whose frontmost is true) '
+            'to perform action "AXZoom" of window 1'
+        )
+        return "Window maximized, Sir."
+
+    def _window_hide_others(self) -> str:
+        self._applescript(
+            'tell application "System Events" to set visible of every process '
+            'whose visible is true and frontmost is false to false'
+        )
+        return "Hiding all other windows, Sir. Focus mode activated."
+
+    def _window_side_by_side(self, app1: str, app2: str) -> str:
+        # Use macOS Split View via Mission Control shortcut
+        self._applescript(f'''
+        tell application "{app1}" to activate
+        delay 0.4
+        tell application "System Events"
+            tell process "{app1}"
+                set btn to button 3 of window 1
+                perform action "AXShowMenu" of btn
+            end tell
+        end tell
+        ''')
+        return f"Attempting split view with {app1}, Sir."
+
+    # ── Proactive monitor ─────────────────────────────────────────────────────
+
+    def _check_battery(self) -> Optional[str]:
+        try:
+            out = subprocess.run(["pmset", "-g", "batt"], capture_output=True, text=True).stdout
+            m = re.search(r"(\d+)%", out)
+            if m and "discharging" in out.lower():
+                pct = int(m.group(1))
+                if pct <= 20:
+                    return f"Sir, your battery is at {pct} percent. I recommend plugging in."
+        except Exception:
+            pass
+        return None
+
+    def _check_calendar_soon(self) -> Optional[str]:
+        try:
+            result = self._applescript('''
+                tell application "Calendar"
+                    set nowDate to current date
+                    set soonDate to nowDate + (10 * minutes)
+                    set hits to {}
+                    repeat with cal in every calendar
+                        repeat with ev in every event of cal
+                            try
+                                if start date of ev >= nowDate and start date of ev <= soonDate then
+                                    set end of hits to (summary of ev)
+                                end if
+                            end try
+                        end repeat
+                    end repeat
+                    if (count of hits) > 0 then
+                        return item 1 of hits
+                    end if
+                    return ""
+                end tell
+            ''')
+            if result and result.strip():
+                return f"Sir, you have an event coming up in the next 10 minutes: {result.strip()}."
+        except Exception:
+            pass
+        return None
+
+    def _morning_briefing(self) -> str:
+        day     = time.strftime("%A, %B %-d")
+        weather = self._get_weather()
+        mem_str = ""
+        try:
+            results = self._mem.recall("reminder goal important", top_k=2)
+            if results:
+                entries = [r.memory.content for r in results]
+                mem_str = " Also, a quick reminder: " + "; ".join(entries) + "."
+        except Exception:
+            pass
+        return f"Good morning, Sir. Today is {day}. {weather}{mem_str} Have a great day."
+
+    def _proactive_loop(self) -> None:
+        _battery_alerted  = False
+        _last_briefing_day = -1
+        while True:
+            time.sleep(60)
+            try:
+                now = time.localtime()
+                # Morning briefing at 8:00 AM
+                if now.tm_hour == 8 and now.tm_min < 2 and now.tm_mday != _last_briefing_day:
+                    _last_briefing_day = now.tm_mday
+                    self.speak_direct(self._morning_briefing())
+
+                # Battery alert
+                batt_msg = self._check_battery()
+                if batt_msg and not _battery_alerted:
+                    _battery_alerted = True
+                    self.speak_direct(batt_msg)
+                elif not batt_msg:
+                    _battery_alerted = False
+
+                # Calendar (every 5 min)
+                if now.tm_min % 5 == 0 and now.tm_sec < 65:
+                    cal_msg = self._check_calendar_soon()
+                    if cal_msg:
+                        self.speak_direct(cal_msg)
+            except Exception:
+                pass
+
+    # ── Wake-word listener ────────────────────────────────────────────────────
+
+    def _record_wake_check(self) -> bytes:
+        """Record a short clip (max 3 s) for wake-word detection."""
+        self._drain_q()
+        buf = b""
+        speaking = False
+        silence_ms = 0
+
+        def _cb(indata: np.ndarray, *_) -> None:
+            self._audio_q.put(bytes(indata))
+
+        deadline = time.time() + 3.0
+        with sd.RawInputStream(
+            samplerate=SAMPLE_RATE, blocksize=FRAME_SIZE,
+            dtype="int16", channels=1, callback=_cb,
+        ):
+            while time.time() < deadline:
+                try:
+                    frame = self._audio_q.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                is_speech = self.vad.is_speech(frame, SAMPLE_RATE)
+                if is_speech:
+                    buf += frame
+                    speaking = True
+                    silence_ms = 0
+                elif speaking:
+                    buf += frame
+                    silence_ms += FRAME_MS
+                    if silence_ms > 700:
+                        break
+        return buf
+
     # ── Clipboard helpers ─────────────────────────────────────────────────────
 
     # Phrases that signal "process my clipboard with the LLM"
@@ -685,6 +924,48 @@ class VoiceAssistant:
             ws_server.send_event({"action": "demo"})
             return "Watch this, Sir."
 
+        # ── Weather ───────────────────────────────────────────────────────────
+        if re.search(r"\b(?:weather|forecast|temperature|how\s+(?:hot|cold|warm)\s+is\s+it|"
+                     r"will\s+it\s+rain|is\s+it\s+(?:raining|snowing|sunny|cloudy))\b", t):
+            m = re.search(r"\bin\s+([a-z\s]+?)(?:\s+(?:today|tomorrow|now|right now))?\s*[?.]?\s*$", t)
+            loc = m.group(1).strip() if m else ""
+            return self._get_weather(loc)
+
+        # ── Persistent memory ─────────────────────────────────────────────────
+        # "remember that X is Y" / "remember: X"
+        m = re.search(
+            r"\b(?:remember\s+(?:that\s+)?|note\s+(?:that\s+)?|save\s+(?:that\s+)?)(.+)", t
+        )
+        if m:
+            fact = m.group(1).strip().rstrip(".,!")
+            # Try to split "X is Y" or "X: Y"
+            kv = re.split(r"\s+is\s+|\s*:\s*", fact, maxsplit=1)
+            if len(kv) == 2:
+                self._memory_set(kv[0], kv[1])
+                return f"Got it, Sir. I'll remember that {kv[0]} is {kv[1]}."
+            else:
+                self._memory_set(fact, fact)
+                return f"Noted, Sir: {fact}."
+
+        # "what do you remember" / "recall X"
+        m = re.search(r"\b(?:what\s+do\s+you\s+remember|recall|remember\s+about|what\s+did\s+i\s+tell\s+you)\b.*?(?:about\s+(.+))?$", t)
+        if m:
+            query = (m.group(1) or "").strip().rstrip("?.!")
+            return self._memory_recall(query)
+
+        # "forget about X"
+        m = re.search(r"\bforget\s+(?:about\s+)?(.+)", t)
+        if m:
+            return self._memory_forget(m.group(1).strip().rstrip("?.!"))
+
+        # ── Window management ─────────────────────────────────────────────────
+        if re.search(r"\b(?:maximize|full\s*screen|make\s+(?:the\s+)?window\s+(?:bigger|larger|fullscreen))\b", t):
+            return self._window_maximize()
+
+        if re.search(r"\b(?:focus\s+mode|hide\s+(?:all\s+)?other(?:s|\s+windows?)|"
+                     r"show\s+only\s+this|distraction\s+free)\b", t):
+            return self._window_hide_others()
+
         return None
 
     # ── Spinner ───────────────────────────────────────────────────────────────
@@ -819,15 +1100,38 @@ class VoiceAssistant:
     def run(self) -> None:
         print("\n" + "═" * 58)
         print("  🟢  Voice assistant ready — just speak!")
+        print(f"  Wake word active after {WAKE_TIMEOUT}s silence — say 'Hey Jarvis'")
         print("  Open http://localhost:3000 to see the UI")
         print("  Press Ctrl+C to quit")
         print("═" * 58 + "\n")
+
+        _last_input = time.time()
+        _wake_mode  = False
+        _WAKE_WORDS = ("hey jarvis", "jarvis", "hey j", "wake up")
 
         while True:
             try:
                 if ws_server.is_muted():
                     ws_server.set_state("idle")
                     time.sleep(0.1)
+                    continue
+
+                # Switch to wake-word mode after timeout
+                if not _wake_mode and time.time() - _last_input > WAKE_TIMEOUT:
+                    _wake_mode = True
+                    print("💤  Wake-word mode — say 'Hey Jarvis' to wake me up.", flush=True)
+                    ws_server.set_state("idle")
+
+                if _wake_mode:
+                    audio = self._record_wake_check()
+                    if not audio:
+                        continue
+                    text = self.transcribe(audio).lower().strip()
+                    if any(w in text for w in _WAKE_WORDS):
+                        _wake_mode  = False
+                        _last_input = time.time()
+                        print("🟢  Woke up!", flush=True)
+                        self.speak_direct("Yes, Sir?")
                     continue
 
                 audio = self.record_audio()
@@ -844,6 +1148,7 @@ class VoiceAssistant:
                 print("  (Didn't catch that — try again)\n")
                 continue
 
+            _last_input = time.time()   # reset idle timer on every real input
             print(f"You: {user_input}")
 
             # Clipboard augmentation (before system-command check)
