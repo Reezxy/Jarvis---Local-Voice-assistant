@@ -59,6 +59,17 @@ PLAYER_BLOCKSIZE = 4_096
 # Whisper decoding: greedy-ish by default. See README "STT speed vs accuracy".
 STT_BEAM_SIZE_DEFAULT = 2
 
+# Barge-in: how much *continuous* speech is needed to cut Jarvis off mid-sentence.
+# Long enough that a cough or a door doesn't stop him, short enough to feel instant.
+BARGE_IN_SUSTAIN_MS = 360
+# Ignore the mic for a moment after playback starts — the output device ramping
+# up otherwise reads as a burst of "speech" on the very first frames.
+BARGE_IN_GRACE_MS   = 350
+# int16 RMS gate on top of the VAD. TTS bleeding back through the mic is much
+# quieter than someone actually talking to the machine; this is what separates them.
+BARGE_IN_RMS_FLOOR  = 900.0
+BARGE_IN_VAD_LEVEL  = 3
+
 SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
 CLAUSE_RE   = re.compile(r"(?<=[,;:])\s+")
 MIN_CLAUSE_WORDS = 8
@@ -159,6 +170,96 @@ class SeamlessPlayer:
                     self._done.set()
 
 
+# ── Barge-in listener ──────────────────────────────────────────────────────────
+class BargeInListener:
+    """
+    Mic watchdog that runs *while Jarvis is speaking* so the user can cut him off.
+
+    Deliberately cheap: webrtcvad on 30 ms frames plus an RMS gate — no Whisper,
+    no LLM. It fires only after BARGE_IN_SUSTAIN_MS of *continuous* qualifying
+    speech, which is what keeps background noise and Jarvis's own voice bleeding
+    into the mic from triggering a false interrupt.
+
+    The frames that caused the trigger are kept in `prefix` so the first word of
+    the interrupting utterance isn't lost when recording takes over.
+    """
+
+    def __init__(self, on_trigger, *, sustain_ms: int = BARGE_IN_SUSTAIN_MS,
+                 grace_ms: int = BARGE_IN_GRACE_MS,
+                 rms_floor: float = BARGE_IN_RMS_FLOOR,
+                 vad_level: int = BARGE_IN_VAD_LEVEL) -> None:
+        self._on_trigger = on_trigger
+        self._sustain_ms = sustain_ms
+        self._grace_ms   = grace_ms
+        self._rms_floor  = rms_floor
+        self._vad        = webrtcvad.Vad(vad_level)
+        self._q: queue.Queue[bytes] = queue.Queue()
+        self._stop       = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self.triggered   = threading.Event()
+        self.prefix: bytes = b""
+
+    def start(self) -> None:
+        self._stop.clear()
+        self.triggered.clear()
+        self.prefix = b""
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+
+    def _qualifies(self, frame: bytes) -> bool:
+        if not self._vad.is_speech(frame, SAMPLE_RATE):
+            return False
+        samples = np.frombuffer(frame, dtype="int16").astype(np.float32)
+        return float(np.sqrt(np.mean(samples * samples))) >= self._rms_floor
+
+    def _run(self) -> None:
+        def _cb(indata: np.ndarray, *_) -> None:
+            self._q.put(bytes(indata))
+
+        try:
+            stream = sd.RawInputStream(
+                samplerate=SAMPLE_RATE, blocksize=FRAME_SIZE,
+                dtype="int16", channels=1, callback=_cb,
+            )
+        except Exception:
+            return   # mic busy or unavailable — barge-in is simply off this turn
+
+        frames: list[bytes] = []
+        speech_ms   = 0
+        grace_until = time.time() + self._grace_ms / 1_000.0
+        try:
+            with stream:
+                while not self._stop.is_set():
+                    try:
+                        frame = self._q.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+                    if time.time() < grace_until:
+                        continue
+                    if self._qualifies(frame):
+                        frames.append(frame)
+                        speech_ms += FRAME_MS
+                        if speech_ms >= self._sustain_ms:
+                            self.prefix = b"".join(frames)
+                            self.triggered.set()
+                            try:
+                                self._on_trigger()
+                            except Exception:
+                                pass
+                            return
+                    else:
+                        frames.clear()
+                        speech_ms = 0
+        except Exception:
+            pass
+
+
 # ── Voice Assistant ────────────────────────────────────────────────────────────
 class VoiceAssistant:
     def __init__(self) -> None:
@@ -181,6 +282,19 @@ class VoiceAssistant:
             "Keep answers brief and conversational. No bullet points or markdown.",
         )
         self._stop_speak = threading.Event()
+
+        # Barge-in: set while an interrupt is pending, with the audio that
+        # triggered it so record_audio() can keep the user's first word.
+        bi = self.cfg.get("barge_in", {})
+        self._barge_in_enabled: bool = bool(bi.get("enabled", True))
+        self._barge_in_opts = {
+            "sustain_ms": int(bi.get("sustain_ms", BARGE_IN_SUSTAIN_MS)),
+            "grace_ms":   int(bi.get("grace_ms", BARGE_IN_GRACE_MS)),
+            "rms_floor":  float(bi.get("rms_floor", BARGE_IN_RMS_FLOOR)),
+            "vad_level":  int(bi.get("vad_level", BARGE_IN_VAD_LEVEL)),
+        }
+        self._barge_in = threading.Event()
+        self._barge_in_audio: bytes = b""
 
         # Persistent neural memory
         from neural_memory import MemoryConfig
@@ -299,11 +413,15 @@ class VoiceAssistant:
             except queue.Empty:
                 break
 
-    def record_audio(self) -> bytes:
+    def record_audio(self, prefix: bytes = b"") -> bytes:
         """
         Record a full user utterance.
         Uses adaptive silence: short commands cut off at 600 ms,
         longer speech (> 2.5 s) gets 950 ms — so you can finish long sentences.
+
+        `prefix` carries frames already captured elsewhere — the speech that
+        triggered a barge-in — so the interrupting utterance keeps its opening
+        word instead of starting mid-syllable.
         """
         while ws_server.is_muted():
             ws_server.set_state("idle")
@@ -312,10 +430,11 @@ class VoiceAssistant:
         self._drain_q()
         ws_server.set_state("listening")
         print("🎤  Listening …", flush=True)
-        buf        = b""
+        buf        = prefix
         silence_ms = 0
-        speech_ms  = 0
-        speaking   = False
+        # Frames are 16-bit mono, so 2 bytes per sample.
+        speech_ms  = len(prefix) * 1_000 // (2 * SAMPLE_RATE)
+        speaking   = bool(prefix)
 
         def _cb(indata: np.ndarray, *_) -> None:
             self._audio_q.put(bytes(indata))
@@ -374,21 +493,72 @@ class VoiceAssistant:
         )
         return np.asarray(samples, dtype=np.float32)
 
-    def speak_direct(self, text: str) -> None:
+    def speak_direct(self, text: str, allow_barge_in: bool = True) -> None:
         """Speak text immediately via TTS — no LLM involved."""
+        self._stop_speak.clear()
         ws_server.set_state("speaking")
+        player   = SeamlessPlayer(sample_rate=TTS_RATE)
+        listener = self._make_barge_listener(player) if allow_barge_in else None
         try:
-            wav    = self._synthesise(text)
-            player = SeamlessPlayer(sample_rate=TTS_RATE)
+            wav = self._synthesise(text)
             player.start()
             player.feed(wav)
             player.mark_done()
+            if listener is not None:
+                listener.start()
             player.wait()
         finally:
+            if listener is not None:
+                listener.stop()
+                self._consume_barge_in(listener)
+            player.stop()
             ws_server.set_state("idle")
 
     def stop_speaking(self) -> None:
         self._stop_speak.set()
+
+    # ── Barge-in ──────────────────────────────────────────────────────────────
+
+    def _make_barge_listener(
+        self, player: SeamlessPlayer,
+        sentence_q: "Optional[queue.Queue[Optional[str]]]" = None,
+    ) -> Optional[BargeInListener]:
+        """
+        Build a listener that kills playback the moment the user starts talking.
+
+        Returns None when barge-in is disabled, in which case callers just skip
+        start()/stop() — nothing else in the pipeline changes.
+        """
+        if not self._barge_in_enabled:
+            return None
+
+        def _on_trigger() -> None:
+            self._stop_speak.set()
+            player.stop()                       # cut the audio device immediately
+            if sentence_q is not None:
+                while True:                     # drop anything still queued for TTS
+                    try:
+                        sentence_q.get_nowait()
+                    except queue.Empty:
+                        break
+                sentence_q.put(None)            # release a blocked TTS thread
+            self._barge_in.set()
+            print("\n✋  Interrupted — listening …", flush=True)
+
+        return BargeInListener(_on_trigger, **self._barge_in_opts)
+
+    def _consume_barge_in(self, listener: Optional[BargeInListener]) -> None:
+        """Stash the audio that triggered the interrupt for the next recording."""
+        if listener is not None and listener.triggered.is_set():
+            self._barge_in_audio = listener.prefix
+
+    def _take_barge_in_audio(self) -> bytes:
+        """Pop the pending interrupt audio (empty when no barge-in happened)."""
+        if not self._barge_in.is_set():
+            return b""
+        audio, self._barge_in_audio = self._barge_in_audio, b""
+        self._barge_in.clear()
+        return audio
 
     # ── System commands ───────────────────────────────────────────────────────
 
@@ -659,13 +829,13 @@ class VoiceAssistant:
                 # Morning briefing at 8:00 AM
                 if now.tm_hour == 8 and now.tm_min < 2 and now.tm_mday != _last_briefing_day:
                     _last_briefing_day = now.tm_mday
-                    self.speak_direct(self._morning_briefing())
+                    self.speak_direct(self._morning_briefing(), allow_barge_in=False)
 
                 # Battery alert
                 batt_msg = self._check_battery()
                 if batt_msg and not _battery_alerted:
                     _battery_alerted = True
-                    self.speak_direct(batt_msg)
+                    self.speak_direct(batt_msg, allow_barge_in=False)
                 elif not batt_msg:
                     _battery_alerted = False
 
@@ -673,7 +843,7 @@ class VoiceAssistant:
                 if now.tm_min % 5 == 0 and now.tm_sec < 65:
                     cal_msg = self._check_calendar_soon()
                     if cal_msg:
-                        self.speak_direct(cal_msg)
+                        self.speak_direct(cal_msg, allow_barge_in=False)
             except Exception:
                 pass
 
@@ -1041,6 +1211,10 @@ class VoiceAssistant:
         full = ""
 
         for chunk in stream:
+            # A barge-in already killed playback — stop burning tokens on a
+            # reply nobody is going to hear.
+            if self._stop_speak.is_set():
+                break
             delta: str = chunk["choices"][0]["delta"].get("content", "") or ""
             buf  += delta
             full += delta
@@ -1078,6 +1252,7 @@ class VoiceAssistant:
         sentence_q: queue.Queue[Optional[str]] = queue.Queue()
         player = SeamlessPlayer(sample_rate=TTS_RATE)
         player.start()
+        listener = self._make_barge_listener(player, sentence_q)
 
         first_audio_ready = threading.Event()
         display_parts: list[str] = []
@@ -1117,9 +1292,13 @@ class VoiceAssistant:
         llm_t.start()
         tts_t.start()
 
-        first_audio_ready.wait(timeout=60)
+        got_audio = first_audio_ready.wait(timeout=60)
         stop_spin.set()
         spin_t.join()
+
+        # Only listen for an interrupt once audio is actually coming out.
+        if got_audio and listener is not None:
+            listener.start()
 
         tts_t.join()
         with display_lock:
@@ -1128,7 +1307,12 @@ class VoiceAssistant:
         sys.stdout.flush()
 
         player.wait()
-        llm_t.join()
+        if listener is not None:
+            listener.stop()
+            self._consume_barge_in(listener)
+        # stream_sentences checks _stop_speak, so an interrupted generation
+        # unwinds promptly; the timeout is a backstop, not the normal path.
+        llm_t.join(timeout=5.0)
         ws_server.set_state("idle")
 
     # ── Main loop ─────────────────────────────────────────────────────────────
@@ -1144,6 +1328,8 @@ class VoiceAssistant:
         _last_input = time.time()
         _wake_mode  = False
         _WAKE_WORDS = ("hey jarvis", "jarvis", "hey j", "wake up")
+        # Speech captured by a barge-in, replayed into the next recording.
+        _prefix     = b""
 
         while True:
             try:
@@ -1158,7 +1344,7 @@ class VoiceAssistant:
                     print("💤  Wake-word mode — say 'Hey Jarvis' to wake me up.", flush=True)
                     ws_server.set_state("idle")
 
-                if _wake_mode:
+                if _wake_mode and not _prefix:
                     audio = self._record_wake_check()
                     if not audio:
                         continue
@@ -1170,7 +1356,8 @@ class VoiceAssistant:
                         self.speak_direct("Yes, Sir?")
                     continue
 
-                audio = self.record_audio()
+                audio  = self.record_audio(prefix=_prefix)
+                _prefix = b""
                 if not audio:
                     continue
 
@@ -1203,6 +1390,13 @@ class VoiceAssistant:
                     if last:
                         self._copy_to_clipboard(last)
                         print("📋  Improved text copied to clipboard.", flush=True)
+
+            # The user talked over Jarvis: go straight back to recording with
+            # the speech that triggered the interrupt, no "Yes, Sir?" roundtrip.
+            _prefix = self._take_barge_in_audio()
+            if _prefix:
+                _wake_mode  = False
+                _last_input = time.time()
 
             print()
 

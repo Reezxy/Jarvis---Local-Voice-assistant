@@ -122,6 +122,9 @@ python chatbot_speech_to_speech.py
 | `stt.compute_type` | `int8` (default), `int8_float16`, `float32` |
 | `stt.language` | `en`, `de`, … |
 | `tts.voice` / `speed` | Kokoro voice ID and playback rate |
+| `barge_in.enabled` | Let the user interrupt Jarvis mid-sentence (default `true`) |
+| `barge_in.sustain_ms` | Continuous speech required to interrupt — raise if noise trips it |
+| `barge_in.rms_floor` | Loudness gate that keeps Jarvis's own voice from interrupting him |
 
 ---
 
@@ -182,9 +185,33 @@ the fastest row whose WER you can live with, then set it in `config.json`.
 - **Streaming** LLM → chunked TTS → gapless playback
 - **Orb states**: idle · listening · thinking · speaking (+ demo effects)
 - **Mute** via orb UI
+- **Barge-in** — start talking while Jarvis is speaking and he stops instantly, then records your new utterance without a wake-word roundtrip
 - **macOS automation** — open/quit apps, volume, screenshots, timers, Maps, Finder, clipboard augmentation — all via AppleScript / CLI, no LLM roundtrip
 - **STT overlay** in the native app — shows the transcribed text as a small pill in the corner
 - **Live logs** window in the native app
+
+---
+
+## Barge-in (interrupting Jarvis)
+
+While audio is playing, a `webrtcvad` watchdog listens on the mic in parallel —
+no Whisper, no LLM, so it costs essentially nothing next to playback. Once it
+sees `barge_in.sustain_ms` of *continuous* speech that also clears an RMS
+loudness gate, it stops the player mid-buffer, drops the queued sentences,
+aborts the LLM stream, and hands the frames it already captured straight to the
+recorder, so your first word survives.
+
+The two gates exist for two different false triggers: the **sustain** window
+rejects coughs, keyboard clatter, and door noise, while the **RMS floor**
+rejects Jarvis's own voice bleeding back from the speakers, which is
+VAD-positive but much quieter than someone actually addressing the machine.
+
+If he cuts himself off, raise `barge_in.rms_floor`. If he ignores you, lower it.
+If ambient noise interrupts him, raise `barge_in.sustain_ms`.
+
+Proactive announcements (battery, calendar, morning briefing) deliberately run
+with barge-in off — the main loop may already be recording, and an interrupt
+there would have no turn to hand the audio to.
 
 ---
 

@@ -21,5 +21,12 @@
     "beam_size": 2,
     "compute_type": "int8",
     "language": "en"
+  },
+  "barge_in": {
+    "enabled": true,
+    "sustain_ms": 360,
+    "grace_ms": 350,
+    "rms_floor": 900,
+    "vad_level": 3
   }
 }
