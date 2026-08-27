@@ -23,7 +23,7 @@ On first launch macOS will ask for **microphone access** — click Allow.
 | Piece | Technology |
 |---|---|
 | **LLM** | [Llama 3.2 3B Instruct](https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF) Q4_K_M via **llama-cpp-python** (Apple **Metal** GPU) |
-| **STT** | **faster-whisper** (`small` / `base`, `int8`) + **webrtcvad** end-of-speech |
+| **STT** | **faster-whisper** (configurable model + `beam_size`, `int8`) + **webrtcvad** end-of-speech |
 | **TTS** | **kokoro-onnx** — voice `am_fenrir` (male EN) |
 | **UI** | **Vite** + **TypeScript** + **Three.js** particle orb; real-time state over WebSocket |
 | **Bridge** | `ws_server.py`: HTTP **:3000** serves `frontend/dist/`, WS **:8765** pushes state |
@@ -41,6 +41,8 @@ On first launch macOS will ask for **microphone access** — click Allow.
 ├── frontend/
 │   ├── src/                      # Three.js orb source (TypeScript)
 │   └── dist/                     # Pre-built UI (committed — no Node needed at runtime)
+├── scripts/
+│   └── benchmark_stt.py          # STT latency vs. accuracy sweep
 └── JarvisApp/                    # Native macOS wrapper
     ├── JarvisApp.xcodeproj/
     ├── JarvisApp/                # Swift sources
@@ -115,8 +117,63 @@ python chatbot_speech_to_speech.py
 | `llm.n_gpu_layers` | `-1` = full Metal offload |
 | `llm.temperature` / `max_new_tokens` | Generation quality vs. speed |
 | `stt.model_size` | `tiny` / `base` / `small` — accuracy vs. latency |
+| `stt.model` | Optional override: any faster-whisper size **or** HF repo id (e.g. `distil-whisper/distil-small.en`). Takes precedence over `model_size` |
+| `stt.beam_size` | Whisper decode width — `1` greedy (fastest) … `5` (old default, slowest) |
+| `stt.compute_type` | `int8` (default), `int8_float16`, `float32` |
 | `stt.language` | `en`, `de`, … |
 | `tts.voice` / `speed` | Kokoro voice ID and playback rate |
+
+---
+
+## STT speed vs. accuracy
+
+Transcription sits directly on the critical path: nothing else in a turn starts
+until Whisper returns. Two knobs move it.
+
+**`stt.beam_size`** — beam search explores *n* candidate decodings in parallel.
+The old hard-coded `5` roughly triples decode work versus greedy for a gain that
+is mostly invisible on short, command-shaped utterances. The default is now `2`;
+drop to `1` if you want the floor.
+
+**`stt.model` / `stt.model_size`** — smaller models are dramatically faster but
+degrade on accents, proper nouns, and noisy rooms.
+
+| Model | Relative speed | Where it breaks down |
+|---|---|---|
+| `tiny.en` | fastest | Proper nouns, app names, accented speech — expect to repeat yourself |
+| `base.en` | fast | Good floor for short commands; struggles with long dictation |
+| `distil-whisper/distil-small.en` | fast, `small`-class accuracy | English only; extra ~500 MB download |
+| `small` (default) | slowest of these | Best accuracy here, noticeably more latency per turn |
+
+The `.en`-suffixed and distil models are **English-only** — keep `small` (or
+another multilingual size) if you set `stt.language` to anything but `en`.
+
+Rule of thumb: pair a *smaller model* with a *larger beam* rather than the other
+way round. `base.en` + `beam_size: 2` beats `small` + `beam_size: 1` on both axes
+for most command traffic.
+
+### Measure it on your machine
+
+Numbers depend on your CPU, mic, and accent, so benchmark rather than trust a
+table:
+
+```bash
+source .venv311/bin/activate
+
+# Synthesise test clips with the project's own Kokoro voice (no recordings needed)
+python scripts/benchmark_stt.py --synthesise
+
+# Or use your own: samples/foo.wav (16-bit mono) + samples/foo.txt (reference text)
+python scripts/benchmark_stt.py --samples samples/ --beams 1 2 5
+```
+
+It sweeps every (model, beam_size) pair and prints mean latency per clip,
+real-time factor, and word error rate against the reference transcripts. Pick
+the fastest row whose WER you can live with, then set it in `config.json`.
+
+> Synthesised speech is clean and consistent — it is a good *relative* ranking
+> of configurations, but it flatters every model's WER. For an absolute read on
+> how a config handles your voice and your room, record real clips.
 
 ---
 

@@ -3,7 +3,7 @@ Local Voice Assistant — Jarvis Edition
 ─────────────────────────────────────────────────────────────────────────────
 LLM  : Llama-3.2-3B-Instruct Q4_K_M via llama-cpp-python (Apple Metal GPU)
 TTS  : Kokoro-82M ONNX  ·  voice: am_fenrir (male)  ·  ~200 ms/sentence
-STT  : faster-whisper 'base' + int8 quantisation + VAD filter
+STT  : faster-whisper (configurable model + beam_size) + int8 + VAD filter
 ─────────────────────────────────────────────────────────────────────────────
 Pipeline   : LLM-stream → TTS-stream → SeamlessPlayer (zero-gap audio)
 System cmds: volume, apps, screenshot, timer — executed locally, no LLM
@@ -55,6 +55,9 @@ SILENCE_CUTOFF_LONG_MS   = 950
 LONG_SPEECH_THRESHOLD_MS = 2_500   # use long cutoff after 2.5 s of speech
 
 PLAYER_BLOCKSIZE = 4_096
+
+# Whisper decoding: greedy-ish by default. See README "STT speed vs accuracy".
+STT_BEAM_SIZE_DEFAULT = 2
 
 SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
 CLAUSE_RE   = re.compile(r"(?<=[,;:])\s+")
@@ -263,22 +266,28 @@ class VoiceAssistant:
     def _load_stt(self) -> None:
         from faster_whisper import WhisperModel
 
-        c    = self.cfg["stt"]
-        size = c.get("model_size", "base")
+        c = self.cfg["stt"]
+        # "model" wins over "model_size" — it accepts a plain size ("tiny", "base")
+        # *or* a HuggingFace repo id such as "distil-whisper/distil-small.en".
+        size = c.get("model") or c.get("model_size", "base")
+        compute_type = c.get("compute_type", "int8")
         print(f"[STT] Loading faster-whisper '{size}' …")
         try:
             # Always try local cache first — avoids HuggingFace network call when offline.
             self._stt = WhisperModel(
-                size, device="cpu", compute_type="int8", local_files_only=True
+                size, device="cpu", compute_type=compute_type, local_files_only=True
             )
         except Exception:
             # Model not in local cache yet — download it (requires internet).
             print(f"[STT] Model not cached — downloading faster-whisper '{size}' …")
             self._stt = WhisperModel(
-                size, device="cpu", compute_type="int8", local_files_only=False
+                size, device="cpu", compute_type=compute_type, local_files_only=False
             )
         self._lang: str = c.get("language", "en")
-        print("[STT] Ready")
+        # beam_size 1 = greedy (fastest). 5 was the old default and costs ~2-3x
+        # the decode time for a marginal WER gain on short command-style speech.
+        self._beam_size: int = max(1, int(c.get("beam_size", STT_BEAM_SIZE_DEFAULT)))
+        print(f"[STT] Ready (beam_size={self._beam_size})")
 
     # ── Audio helpers ─────────────────────────────────────────────────────────
 
@@ -346,7 +355,7 @@ class VoiceAssistant:
         segments, _ = self._stt.transcribe(
             audio,
             language=self._lang,
-            beam_size=5,
+            beam_size=self._beam_size,
             temperature=0,                      # deterministic, no random sampling
             condition_on_previous_text=False,   # no hallucination from prior context
             vad_filter=True,

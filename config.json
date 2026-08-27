@@ -18,6 +18,8 @@
   },
   "stt": {
     "model_size": "small",
+    "beam_size": 2,
+    "compute_type": "int8",
     "language": "en"
   }
 }
