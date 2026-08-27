@@ -389,6 +389,13 @@ class VoiceAssistant:
         )
         self._stop_speak = threading.Event()
 
+        # Serialises every path that opens an output stream. The proactive
+        # monitor runs on its own thread, so without this a battery or calendar
+        # announcement can land on the output device while the main loop is
+        # already speaking a reply — two streams, one speaker. Reentrant so a
+        # nested speak from the same thread can't deadlock.
+        self._speak_lock = threading.RLock()
+
         # Barge-in: set while an interrupt is pending, with the audio that
         # triggered it so record_audio() can keep the user's first word.
         bi = self.cfg.get("barge_in", {})
@@ -601,24 +608,27 @@ class VoiceAssistant:
 
     def speak_direct(self, text: str, allow_barge_in: bool = True) -> None:
         """Speak text immediately via TTS — no LLM involved."""
-        self._stop_speak.clear()
-        ws_server.set_state("speaking")
-        player   = SeamlessPlayer(sample_rate=TTS_RATE)
-        listener = self._make_barge_listener(player) if allow_barge_in else None
-        try:
-            wav = self._synthesise(text)
-            player.start()
-            player.feed(wav)
-            player.mark_done()
-            if listener is not None:
-                listener.start()
-            player.wait()
-        finally:
-            if listener is not None:
-                listener.stop()
-                self._consume_barge_in(listener)
-            player.stop()
-            ws_server.set_state("idle")
+        # Callers on other threads (the proactive monitor) queue behind the
+        # current speaker instead of overlapping with it.
+        with self._speak_lock:
+            self._stop_speak.clear()
+            ws_server.set_state("speaking")
+            player   = SeamlessPlayer(sample_rate=TTS_RATE)
+            listener = self._make_barge_listener(player) if allow_barge_in else None
+            try:
+                wav = self._synthesise(text)
+                player.start()
+                player.feed(wav)
+                player.mark_done()
+                if listener is not None:
+                    listener.start()
+                player.wait()
+            finally:
+                if listener is not None:
+                    listener.stop()
+                    self._consume_barge_in(listener)
+                player.stop()
+                ws_server.set_state("idle")
 
     def stop_speaking(self) -> None:
         self._stop_speak.set()
@@ -926,6 +936,11 @@ class VoiceAssistant:
         return f"Good morning, Sir. Today is {day}. {weather}{mem_str} Have a great day."
 
     def _proactive_loop(self) -> None:
+        """
+        Background monitor. Every speak_direct() call from here contends for
+        _speak_lock with the main loop, so an announcement waits its turn on the
+        output device instead of overlapping with a reply already in progress.
+        """
         _battery_alerted  = False
         _last_briefing_day = -1
         while True:
@@ -1318,74 +1333,77 @@ class VoiceAssistant:
 
     def handle_turn(self, user_input: str) -> None:
         """Three-thread pipeline: LLM → TTS → SeamlessPlayer (zero-gap audio)."""
-        self._stop_speak.clear()
-        ws_server.set_state("thinking")
+        # One turn owns the output device from first sentence to last, so a
+        # proactive announcement can't start mid-reply.
+        with self._speak_lock:
+            self._stop_speak.clear()
+            ws_server.set_state("thinking")
 
-        sentence_q: queue.Queue[Optional[str]] = queue.Queue()
-        player = SeamlessPlayer(sample_rate=TTS_RATE)
-        player.start()
-        listener = self._make_barge_listener(player, sentence_q)
+            sentence_q: queue.Queue[Optional[str]] = queue.Queue()
+            player = SeamlessPlayer(sample_rate=TTS_RATE)
+            player.start()
+            listener = self._make_barge_listener(player, sentence_q)
 
-        first_audio_ready = threading.Event()
-        display_parts: list[str] = []
-        display_lock = threading.Lock()
+            first_audio_ready = threading.Event()
+            display_parts: list[str] = []
+            display_lock = threading.Lock()
 
-        def _llm() -> None:
-            for chunk in self.stream_sentences(user_input):
-                sentence_q.put(chunk)
-            sentence_q.put(None)
+            def _llm() -> None:
+                for chunk in self.stream_sentences(user_input):
+                    sentence_q.put(chunk)
+                sentence_q.put(None)
 
-        def _tts() -> None:
-            first = True
-            while True:
-                chunk = sentence_q.get()
-                if chunk is None:
-                    break
-                if self._stop_speak.is_set():
-                    break
-                wav = self._synthesise(chunk)
-                player.feed(wav)
-                with display_lock:
-                    display_parts.append(chunk)
-                if first:
-                    ws_server.set_state("speaking")
-                    first_audio_ready.set()
-                    first = False
-            player.mark_done()
+            def _tts() -> None:
+                first = True
+                while True:
+                    chunk = sentence_q.get()
+                    if chunk is None:
+                        break
+                    if self._stop_speak.is_set():
+                        break
+                    wav = self._synthesise(chunk)
+                    player.feed(wav)
+                    with display_lock:
+                        display_parts.append(chunk)
+                    if first:
+                        ws_server.set_state("speaking")
+                        first_audio_ready.set()
+                        first = False
+                player.mark_done()
 
-        llm_t = threading.Thread(target=_llm, daemon=True)
-        tts_t = threading.Thread(target=_tts, daemon=True)
+            llm_t = threading.Thread(target=_llm, daemon=True)
+            tts_t = threading.Thread(target=_tts, daemon=True)
 
-        stop_spin = threading.Event()
-        spin_t    = threading.Thread(
-            target=self._spinner, args=(stop_spin,), daemon=True
-        )
-        spin_t.start()
-        llm_t.start()
-        tts_t.start()
+            stop_spin = threading.Event()
+            spin_t    = threading.Thread(
+                target=self._spinner, args=(stop_spin,), daemon=True
+            )
+            spin_t.start()
+            llm_t.start()
+            tts_t.start()
 
-        got_audio = first_audio_ready.wait(timeout=60)
-        stop_spin.set()
-        spin_t.join()
+            got_audio = first_audio_ready.wait(timeout=60)
+            stop_spin.set()
+            spin_t.join()
 
-        # Only listen for an interrupt once audio is actually coming out.
-        if got_audio and listener is not None:
-            listener.start()
+            # Only listen for an interrupt once audio is actually coming out.
+            if got_audio and listener is not None:
+                listener.start()
 
-        tts_t.join()
-        with display_lock:
-            response_text = " ".join(display_parts)
-        sys.stdout.write(f"Jarvis: {response_text}\n")
-        sys.stdout.flush()
+            tts_t.join()
+            with display_lock:
+                response_text = " ".join(display_parts)
+            sys.stdout.write(f"Jarvis: {response_text}\n")
+            sys.stdout.flush()
 
-        player.wait()
-        if listener is not None:
-            listener.stop()
-            self._consume_barge_in(listener)
-        # stream_sentences checks _stop_speak, so an interrupted generation
-        # unwinds promptly; the timeout is a backstop, not the normal path.
-        llm_t.join(timeout=5.0)
-        ws_server.set_state("idle")
+            player.wait()
+            if listener is not None:
+                listener.stop()
+                self._consume_barge_in(listener)
+            # stream_sentences checks _stop_speak, so an interrupted generation
+            # unwinds promptly; the timeout is a backstop, not the normal path.
+            llm_t.join(timeout=5.0)
+            ws_server.set_state("idle")
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
