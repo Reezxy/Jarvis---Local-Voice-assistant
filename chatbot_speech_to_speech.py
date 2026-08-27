@@ -4,6 +4,7 @@ Local Voice Assistant — Jarvis Edition
 LLM  : Llama-3.2-3B-Instruct Q4_K_M via llama-cpp-python (Apple Metal GPU)
 TTS  : Kokoro-82M ONNX  ·  voice: am_fenrir (male)  ·  ~200 ms/sentence
 STT  : faster-whisper (configurable model + beam_size) + int8 + VAD filter
+Wake : openWakeWord 'hey_jarvis' — always-on, near-zero CPU while idle
 ─────────────────────────────────────────────────────────────────────────────
 Pipeline   : LLM-stream → TTS-stream → SeamlessPlayer (zero-gap audio)
 System cmds: volume, apps, screenshot, timer — executed locally, no LLM
@@ -44,6 +45,11 @@ if not CONFIG_PATH.is_file():
 MEMORY_DIR   = str(_DATA_DIR / "jarvis_memory_db")
 
 WAKE_TIMEOUT = 120   # seconds of silence → enter wake-word mode
+
+# openWakeWord runs on 80 ms frames of 16 kHz int16 audio.
+WAKE_CHUNK_SAMPLES   = 1_280
+WAKE_MODEL_DEFAULT   = "hey_jarvis"
+WAKE_THRESHOLD_DEFAULT = 0.5
 SAMPLE_RATE  = 16_000
 TTS_RATE     = 24_000
 FRAME_MS     = 30
@@ -170,6 +176,102 @@ class SeamlessPlayer:
                     self._done.set()
 
 
+# ── Wake word ──────────────────────────────────────────────────────────────────
+class WakeWordDetector:
+    """
+    Continuous "Hey Jarvis" detection via openWakeWord.
+
+    Replaces transcribing every idle clip with full Whisper: the model is a few
+    hundred KB running on 80 ms frames, so idle listening costs a fraction of a
+    core instead of a Whisper decode every couple of seconds — the CPU/GPU
+    headroom belongs to actual turns.
+    """
+
+    def __init__(self, model, names: list[str], threshold: float) -> None:
+        self._model     = model
+        self._names     = names
+        self._threshold = threshold
+
+    @classmethod
+    def create(cls, cfg: dict) -> "Optional[WakeWordDetector]":
+        """
+        Build a detector from the `wake_word` config block.
+
+        Returns None (with a printed reason) when openWakeWord is unavailable or
+        its models can't be fetched — the assistant then simply stays in
+        always-on listening instead of failing to start.
+        """
+        if not cfg.get("enabled", True):
+            return None
+
+        names     = cfg.get("models") or [WAKE_MODEL_DEFAULT]
+        threshold = float(cfg.get("threshold", WAKE_THRESHOLD_DEFAULT))
+        framework = cfg.get("inference_framework", "onnx")
+
+        try:
+            import openwakeword
+            from openwakeword.model import Model
+        except ImportError:
+            print("[Wake] openwakeword not installed — wake-word mode disabled.")
+            print("       pip install -r requirements_speech_to_speech.txt")
+            return None
+
+        print(f"[Wake] Loading openWakeWord {names} …")
+        extra = {}
+        if "vad_threshold" in cfg:
+            extra["vad_threshold"] = float(cfg["vad_threshold"])
+        try:
+            model = Model(wakeword_models=names, inference_framework=framework, **extra)
+        except Exception:
+            # First run: pretrained weights aren't in the openWakeWord cache yet.
+            print("[Wake] Models not cached — downloading (requires internet) …")
+            try:
+                openwakeword.utils.download_models()
+                model = Model(wakeword_models=names, inference_framework=framework, **extra)
+            except Exception as exc:                       # noqa: BLE001
+                print(f"[Wake] Could not load wake-word models ({exc}) — "
+                      "wake-word mode disabled.")
+                return None
+
+        loaded = list(model.prediction_buffer.keys()) or names
+        print(f"[Wake] Ready — {loaded} @ threshold {threshold}")
+        return cls(model, loaded, threshold)
+
+    def listen(self, should_abort=None) -> bool:
+        """
+        Block until the wake word is detected. Returns False if `should_abort()`
+        goes true first (mute) or the mic can't be opened.
+        """
+        audio_q: queue.Queue[bytes] = queue.Queue()
+
+        def _cb(indata: np.ndarray, *_) -> None:
+            audio_q.put(bytes(indata))
+
+        try:
+            stream = sd.RawInputStream(
+                samplerate=SAMPLE_RATE, blocksize=WAKE_CHUNK_SAMPLES,
+                dtype="int16", channels=1, callback=_cb,
+            )
+        except Exception as exc:                           # noqa: BLE001
+            print(f"[Wake] Mic unavailable ({exc})")
+            return False
+
+        self._model.reset()
+        with stream:
+            while True:
+                if should_abort is not None and should_abort():
+                    return False
+                try:
+                    chunk = audio_q.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                samples = np.frombuffer(chunk, dtype="int16")
+                scores  = self._model.predict(samples)
+                if any(scores.get(n, 0.0) >= self._threshold for n in self._names):
+                    self._model.reset()   # don't re-fire on the same utterance
+                    return True
+
+
 # ── Barge-in listener ──────────────────────────────────────────────────────────
 class BargeInListener:
     """
@@ -269,6 +371,10 @@ class VoiceAssistant:
         self._load_llm()
         self._load_tts()
         self._load_stt()
+
+        wake_cfg = self.cfg.get("wake_word", {})
+        self._wake_timeout: float = float(wake_cfg.get("timeout_s", WAKE_TIMEOUT))
+        self._wake = WakeWordDetector.create(wake_cfg)
 
         self.vad = webrtcvad.Vad(3)
         self._audio_q: queue.Queue[bytes] = queue.Queue()
@@ -847,40 +953,6 @@ class VoiceAssistant:
             except Exception:
                 pass
 
-    # ── Wake-word listener ────────────────────────────────────────────────────
-
-    def _record_wake_check(self) -> bytes:
-        """Record a short clip (max 3 s) for wake-word detection."""
-        self._drain_q()
-        buf = b""
-        speaking = False
-        silence_ms = 0
-
-        def _cb(indata: np.ndarray, *_) -> None:
-            self._audio_q.put(bytes(indata))
-
-        deadline = time.time() + 3.0
-        with sd.RawInputStream(
-            samplerate=SAMPLE_RATE, blocksize=FRAME_SIZE,
-            dtype="int16", channels=1, callback=_cb,
-        ):
-            while time.time() < deadline:
-                try:
-                    frame = self._audio_q.get(timeout=0.1)
-                except queue.Empty:
-                    continue
-                is_speech = self.vad.is_speech(frame, SAMPLE_RATE)
-                if is_speech:
-                    buf += frame
-                    speaking = True
-                    silence_ms = 0
-                elif speaking:
-                    buf += frame
-                    silence_ms += FRAME_MS
-                    if silence_ms > 700:
-                        break
-        return buf
-
     # ── Clipboard helpers ─────────────────────────────────────────────────────
 
     # Action words that, combined with clipboard context, trigger clipboard mode
@@ -1320,14 +1392,16 @@ class VoiceAssistant:
     def run(self) -> None:
         print("\n" + "═" * 58)
         print("  🟢  Voice assistant ready — just speak!")
-        print(f"  Wake word active after {WAKE_TIMEOUT}s silence — say 'Hey Jarvis'")
+        if self._wake is not None:
+            print(f"  Wake word active after {self._wake_timeout:.0f}s silence — say 'Hey Jarvis'")
+        else:
+            print("  Wake word disabled — always listening")
         print("  Open http://localhost:3000 to see the UI")
         print("  Press Ctrl+C to quit")
         print("═" * 58 + "\n")
 
         _last_input = time.time()
         _wake_mode  = False
-        _WAKE_WORDS = ("hey jarvis", "jarvis", "hey j", "wake up")
         # Speech captured by a barge-in, replayed into the next recording.
         _prefix     = b""
 
@@ -1339,21 +1413,21 @@ class VoiceAssistant:
                     continue
 
                 # Switch to wake-word mode after timeout
-                if not _wake_mode and time.time() - _last_input > WAKE_TIMEOUT:
+                if (self._wake is not None and not _wake_mode
+                        and time.time() - _last_input > self._wake_timeout):
                     _wake_mode = True
                     print("💤  Wake-word mode — say 'Hey Jarvis' to wake me up.", flush=True)
                     ws_server.set_state("idle")
 
                 if _wake_mode and not _prefix:
-                    audio = self._record_wake_check()
-                    if not audio:
+                    # Blocks on the wake-word model until it hears the phrase —
+                    # no Whisper, no LLM, near-zero cost while idle.
+                    if not self._wake.listen(should_abort=ws_server.is_muted):
                         continue
-                    text = self.transcribe(audio).lower().strip()
-                    if any(w in text for w in _WAKE_WORDS):
-                        _wake_mode  = False
-                        _last_input = time.time()
-                        print("🟢  Woke up!", flush=True)
-                        self.speak_direct("Yes, Sir?")
+                    _wake_mode  = False
+                    _last_input = time.time()
+                    print("🟢  Woke up!", flush=True)
+                    self.speak_direct("Yes, Sir?")
                     continue
 
                 audio  = self.record_audio(prefix=_prefix)

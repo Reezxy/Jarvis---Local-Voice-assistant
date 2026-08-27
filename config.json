@@ -28,5 +28,14 @@
     "grace_ms": 350,
     "rms_floor": 900,
     "vad_level": 3
+  },
+  "wake_word": {
+    "enabled": true,
+    "models": [
+      "hey_jarvis"
+    ],
+    "threshold": 0.5,
+    "inference_framework": "onnx",
+    "timeout_s": 120
   }
 }

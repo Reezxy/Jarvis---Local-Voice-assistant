@@ -24,6 +24,7 @@ On first launch macOS will ask for **microphone access** — click Allow.
 |---|---|
 | **LLM** | [Llama 3.2 3B Instruct](https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF) Q4_K_M via **llama-cpp-python** (Apple **Metal** GPU) |
 | **STT** | **faster-whisper** (configurable model + `beam_size`, `int8`) + **webrtcvad** end-of-speech |
+| **Wake word** | **openWakeWord** `hey_jarvis` — always-on, near-zero CPU while idle |
 | **TTS** | **kokoro-onnx** — voice `am_fenrir` (male EN) |
 | **UI** | **Vite** + **TypeScript** + **Three.js** particle orb; real-time state over WebSocket |
 | **Bridge** | `ws_server.py`: HTTP **:3000** serves `frontend/dist/`, WS **:8765** pushes state |
@@ -125,6 +126,10 @@ python chatbot_speech_to_speech.py
 | `barge_in.enabled` | Let the user interrupt Jarvis mid-sentence (default `true`) |
 | `barge_in.sustain_ms` | Continuous speech required to interrupt — raise if noise trips it |
 | `barge_in.rms_floor` | Loudness gate that keeps Jarvis's own voice from interrupting him |
+| `wake_word.enabled` | Enter wake-word mode after idling (default `true`) |
+| `wake_word.models` | openWakeWord model names or paths (default `["hey_jarvis"]`) |
+| `wake_word.threshold` | Detection confidence `0`–`1` — raise if it false-fires |
+| `wake_word.timeout_s` | Seconds of silence before dropping into wake-word mode |
 
 ---
 
@@ -189,6 +194,27 @@ the fastest row whose WER you can live with, then set it in `config.json`.
 - **macOS automation** — open/quit apps, volume, screenshots, timers, Maps, Finder, clipboard augmentation — all via AppleScript / CLI, no LLM roundtrip
 - **STT overlay** in the native app — shows the transcribed text as a small pill in the corner
 - **Live logs** window in the native app
+
+---
+
+## Wake word
+
+After `wake_word.timeout_s` seconds of silence Jarvis drops into wake-word mode
+and waits for **"Hey Jarvis"**. Detection runs on **openWakeWord** — a few
+hundred KB of ONNX evaluated on 80 ms frames — so idling costs a fraction of a
+core. (It previously ran a full Whisper transcription every idle cycle, which
+burned the headroom that should go to real turns.)
+
+Weights download automatically on first run into openWakeWord's own cache;
+after that it works offline like everything else.
+
+Tuning: raise `wake_word.threshold` if it wakes on its own, lower it if it
+misses you. Custom `.onnx` / `.tflite` models can be listed by path in
+`wake_word.models`. Set `wake_word.enabled` to `false` to stay always-on.
+
+> If `openwakeword` isn't installed, Jarvis prints a warning and stays in
+> always-on listening rather than failing to start — `pip install -r
+> requirements_speech_to_speech.txt` to enable wake mode.
 
 ---
 
