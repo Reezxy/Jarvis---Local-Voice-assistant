@@ -766,6 +766,19 @@ class VoiceAssistant:
             and words[0] not in self._NON_APP_FIRST_WORDS
         )
 
+    @staticmethod
+    def _as_quote(value: str) -> str:
+        """
+        Escape a value for embedding inside an AppleScript double-quoted string.
+
+        App names and labels here come from Whisper transcription, which happily
+        emits quotes and backslashes. Interpolated raw, a name containing `"`
+        closes the string literal early and the remainder is parsed as
+        AppleScript — so anything spoken becomes something executed. Escaping
+        backslash first, then the quote, keeps the value a value.
+        """
+        return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
     def _applescript(self, script: str) -> str:
         result = subprocess.run(
             ["osascript", "-e", script], capture_output=True, text=True
@@ -868,11 +881,12 @@ class VoiceAssistant:
 
     def _window_side_by_side(self, app1: str, app2: str) -> str:
         # Use macOS Split View via Mission Control shortcut
+        name = self._as_quote(app1)
         self._applescript(f'''
-        tell application "{app1}" to activate
+        tell application "{name}" to activate
         delay 0.4
         tell application "System Events"
-            tell process "{app1}"
+            tell process "{name}"
                 set btn to button 3 of window 1
                 perform action "AXShowMenu" of btn
             end tell
@@ -1030,7 +1044,8 @@ class VoiceAssistant:
         print(f"\n⏰  {msg}", flush=True)
         subprocess.run(
             ["osascript", "-e",
-             f'display notification "Timer complete!" with title "Jarvis" subtitle "{label}"'],
+             'display notification "Timer complete!" with title "Jarvis" '
+             f'subtitle "{self._as_quote(label)}"'],
             check=False,
         )
         self.speak_direct(msg)
@@ -1203,7 +1218,9 @@ class VoiceAssistant:
         )
         if m and self._is_app_command(m.group(1)):
             app_name = self._resolve_app_name(m.group(1))
-            self._applescript(f'tell application "{app_name}" to quit')
+            self._applescript(
+                f'tell application "{self._as_quote(app_name)}" to quit'
+            )
             return f"Closing {app_name}."
 
         # ── Orb demo ──────────────────────────────────────────────────────────
