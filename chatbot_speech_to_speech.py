@@ -42,6 +42,8 @@ _DATA_DIR = Path(os.environ["JARVIS_DATA_DIR"]) if "JARVIS_DATA_DIR" in os.envir
 CONFIG_PATH  = _DATA_DIR / "config.json"
 if not CONFIG_PATH.is_file():
     CONFIG_PATH = Path(__file__).parent / "config.json"
+# Keys without a sensible default — startup can't proceed if they're absent.
+REQUIRED_CONFIG_KEYS = ("llm.repo_id", "llm.filename")
 MEMORY_DIR   = str(_DATA_DIR / "jarvis_memory_db")
 
 WAKE_TIMEOUT = 120   # seconds of silence → enter wake-word mode
@@ -82,6 +84,60 @@ MIN_CLAUSE_WORDS = 8
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+class ConfigError(RuntimeError):
+    """config.json is missing, unreadable, malformed, or incomplete."""
+
+
+def _load_config(path: Path = CONFIG_PATH) -> dict:
+    """
+    Read and validate config.json.
+
+    Raises ConfigError with a message a user can act on — a raw traceback out of
+    json.load() at startup tells them nothing about which file or which key.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except FileNotFoundError:
+        raise ConfigError(
+            f"No config.json found at {path}\n"
+            f"   Copy the one shipped in the project root to that location, "
+            f"or set JARVIS_DATA_DIR to the folder that holds it."
+        ) from None
+    except json.JSONDecodeError as exc:
+        raise ConfigError(
+            f"{path} is not valid JSON\n"
+            f"   Line {exc.lineno}, column {exc.colno}: {exc.msg}\n"
+            f"   A trailing comma or a missing quote is the usual cause."
+        ) from None
+    except OSError as exc:
+        raise ConfigError(f"Could not read {path}\n   {exc}") from None
+
+    if not isinstance(cfg, dict):
+        raise ConfigError(
+            f"{path} must hold a JSON object at the top level, "
+            f"found {type(cfg).__name__}."
+        )
+
+    missing: list[str] = []
+    for dotted in REQUIRED_CONFIG_KEYS:
+        node = cfg
+        for part in dotted.split("."):
+            if not isinstance(node, dict) or part not in node:
+                missing.append(dotted)
+                break
+            node = node[part]
+        else:
+            if node in (None, ""):
+                missing.append(dotted)
+    if missing:
+        raise ConfigError(
+            f"{path} is missing required key(s): {', '.join(missing)}\n"
+            f"   Compare it against the config.json in the project root."
+        )
+    return cfg
+
+
 def _download(url: str, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     print(f"  Downloading {dest.name} …", flush=True)
@@ -365,8 +421,7 @@ class BargeInListener:
 # ── Voice Assistant ────────────────────────────────────────────────────────────
 class VoiceAssistant:
     def __init__(self) -> None:
-        with open(CONFIG_PATH, encoding="utf-8") as f:
-            self.cfg: dict = json.load(f)
+        self.cfg: dict = _load_config()
 
         self._load_llm()
         self._load_tts()
@@ -1513,5 +1568,9 @@ class VoiceAssistant:
 if __name__ == "__main__":
     # HTTP/WebSocket sofort — bevor schwere ML-Imports in VoiceAssistant laufen.
     ws_server.start()
-    assistant = VoiceAssistant()
+    try:
+        assistant = VoiceAssistant()
+    except ConfigError as exc:
+        print(f"\n✗  Configuration error\n   {exc}\n", file=sys.stderr)
+        raise SystemExit(2) from None
     assistant.run()
